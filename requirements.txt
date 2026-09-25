@@ -1,0 +1,13 @@
+# Core Computer Vision & Deep Learning
+opencv-python>=4.8.0
+ultralytics>=8.0.0
+numpy>=1.24.0
+# Linear assignment used by Ultralytics' built-in ByteTrack tracker
+# (only needed for tracker_type: bytetrack - the bytetrack_lite fallback is pure NumPy)
+lap>=0.5.12
+
+# Configuration & Utilities
+pyyaml>=6.0
+
+# Testing & Development (optional)
+pytest>=7.0.0

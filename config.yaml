@@ -1,0 +1,70 @@
+# =====================================================================
+# Football Tactical Analysis Configuration
+# =====================================================================
+
+# Model settings for object detection
+model:
+  # Path to YOLO model weights (e.g. yolov8s.pt, yolov8n.pt, yolov8x.pt, or custom trained weights)
+  # Missing weights are downloaded automatically on first run.
+  weights_path: "models/yolov8s.pt"
+  # Minimum confidence threshold for player & ball detections (0.0 to 1.0)
+  confidence_threshold: 0.35
+  # Non-Maximum Suppression (IoU) threshold
+  iou_threshold: 0.5
+  # Hardware device: "cpu", "cuda", or "0" for GPU
+  device: "cpu"
+  # Target class IDs in standard COCO dataset (0 = person, 32 = sports ball)
+  player_class_id: 0
+  ball_class_id: 32
+
+# Video I/O configuration
+video:
+  # Path to input video file (relative to project root or absolute)
+  input_path: "input/match_sample.mp4"
+  # Path for output annotated video
+  output_path: "output/tactical_analysis.mp4"
+  # Maximum frames to process (null for entire video)
+  max_frames: null
+  # Frame stride: process every Nth frame (1 = every frame)
+  frame_stride: 1
+
+# Player tracking configuration (ByteTrack)
+tracker:
+  # Tracking backend: "bytetrack" (Ultralytics' built-in Kalman-filtered
+  # ByteTrack, requires the 'lap' package) or "bytetrack_lite" (dependency-free
+  # NumPy fallback with identical behaviour).
+  tracker_type: "bytetrack"
+  # Detections at/above this confidence drive stage-1 matching
+  track_high_thresh: 0.5
+  # Detections below this confidence are ignored entirely
+  track_low_thresh: 0.1
+  # Confidence required to start a new track (lower to 0.45 if few players get IDs)
+  new_track_thresh: 0.6
+  # Number of frames to keep lost tracks alive before they are discarded
+  track_buffer: 30
+  # Maximum assignment cost (1 - IoU * confidence) in stage 1
+  match_thresh: 0.8
+  # Only track players: the ball is still detected and drawn, but never gets a
+  # track ID (its tiny size makes IoU-based IDs flicker).
+  player_only: true
+
+# Team classification configuration
+team_classifier:
+  # Number of outfield teams
+  n_teams: 2
+  # Torso vertical crop ratio within player bounding box for jersey color extraction
+  torso_crop_top: 0.2
+  torso_crop_bottom: 0.6
+
+# 2D Pitch mapping configuration (Standard FIFA pitch dimensions in meters)
+pitch:
+  length_meters: 105.0
+  width_meters: 68.0
+
+# Logging configuration
+logging:
+  # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
+  # Log message format
+  format: "[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
