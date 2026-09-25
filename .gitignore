@@ -1,0 +1,36 @@
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Large model weights (keep directory structure via .gitkeep)
+models/*.pt
+models/*.onnx
+models/*.engine
+!models/.gitkeep
+
+# Video media files (keep directory structure via .gitkeep)
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+
+# IDEs & OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
