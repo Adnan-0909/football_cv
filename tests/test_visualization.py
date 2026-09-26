@@ -128,3 +128,37 @@ def test_player_marker_can_skip_the_bounding_box():
     )
     assert not frame[50, 150].any(), "no box should have been drawn"
     assert frame.any(), "the ellipse/label should still be drawn"
+
+
+# ---------------------------------------------------------------------- #
+# Stage 3: team legend
+# ---------------------------------------------------------------------- #
+
+def _near(frame: np.ndarray, bgr: tuple[int, int, int], tol: int = 6) -> int:
+    b, g, r = frame[..., 0].astype(int), frame[..., 1].astype(int), frame[..., 2].astype(int)
+    return int(((abs(b - bgr[0]) < tol) & (abs(g - bgr[1]) < tol) & (abs(r - bgr[2]) < tol)).sum())
+
+
+def test_team_legend_draws_both_team_swatch_colours_top_right():
+    frame = np.zeros((240, 480, 3), dtype=np.uint8)
+    counts = {"TEAM_A": 5, "TEAM_B": 3, "UNKNOWN": 1}
+
+    out = TacticalVisualizer().draw_team_legend(frame, counts)
+
+    assert out is frame
+    # Swatches live in the top-right panel only.
+    panel = frame[:100, 480 - 140:]
+    assert _near(panel, visualization.COLOR_TEAM_A) > 100, "TEAM_A swatch missing"
+    assert _near(panel, visualization.COLOR_TEAM_B) > 100, "TEAM_B swatch missing"
+    assert _near(panel, visualization.COLOR_UNKNOWN) > 100, "UNKNOWN swatch missing"
+    # Outside the panel no legend colours were sprayed.
+    rest = frame.copy()
+    rest[:100, 480 - 140:] = 0
+    assert _near(rest, visualization.COLOR_TEAM_A) == 0
+    assert _near(rest, visualization.COLOR_TEAM_B) == 0
+
+
+def test_team_legend_works_without_counts():
+    frame = np.zeros((120, 320, 3), dtype=np.uint8)
+    TacticalVisualizer().draw_team_legend(frame)
+    assert frame.any(), "legend should be drawn even without counts"

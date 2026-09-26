@@ -6,8 +6,9 @@ A computer-vision pipeline for detecting, tracking, and annotating players in fo
 
 - Player, goalkeeper, referee, and ball detection
 - Persistent player tracking IDs
-- Annotated video output
-- Tracking data CSV export
+- Two-team classification from jersey colors (TEAM_A / TEAM_B / UNKNOWN)
+- Annotated video output with per-team colors and a team legend
+- Tracking and team CSV export
 - Configurable processing options
 - Dependency-free lightweight tracker fallback
 
@@ -49,11 +50,18 @@ Limit processing:
 python main.py --input input\match.mp4 --max-frames 200 --stride 2
 ```
 
-Export tracking data:
+Export tracking and team data:
 
 ```powershell
-python main.py --input input\match.mp4 --track-csv output\tracks.csv
+python main.py --input input\match.mp4 --track-csv output\tracks.csv --team-csv output\teams.csv
 ```
+
+`tracks.csv` columns: `frame,timestamp,player_id,x1,y1,x2,y2,cx,cy`
+`teams.csv` columns: `frame,timestamp,player_id,team,cx,cy`
+
+Teams are discovered from the footage itself (no fixed colors): each player is
+labeled `TEAM_A`, `TEAM_B`, or `UNKNOWN` while uncertain (referee, goalkeeper,
+heavy occlusion, background-dominated box).
 
 View available options:
 
@@ -69,14 +77,14 @@ python -m pytest
 
 ## Configuration
 
-Edit `config.yaml` to configure model weights, confidence thresholds, video paths, tracker settings, device selection, and logging.
+Edit `config.yaml` to configure model weights, confidence thresholds, video paths, tracker settings, team classification (`team_classifier` section: torso crop, dominant-color extraction, clustering, uncertainty gates, temporal smoothing), device selection, and logging.
 
 YOLO weights are downloaded automatically when missing.
 
 ## Roadmap
 
-- Team classification
-- Pitch homography and radar projection
-- Formation analysis
-- Passing-lane detection
-- Tactical metrics export
+- [x] Team classification
+- [ ] Pitch homography and radar projection
+- [ ] Formation analysis
+- [ ] Passing-lane detection
+- [ ] Tactical metrics export

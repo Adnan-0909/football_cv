@@ -48,13 +48,76 @@ tracker:
   # track ID (its tiny size makes IoU-based IDs flicker).
   player_only: true
 
-# Team classification configuration
+# Team classification configuration (Stage 3 - jersey colour clustering)
+# Teams are discovered from the footage itself: no fixed RGB values and no
+# "blue = Team A" rule. Players the system cannot separate confidently
+# (referees, goalkeepers, very similar kits) are reported as UNKNOWN.
 team_classifier:
-  # Number of outfield teams
+  # Number of clusters: 2 outfield teams
   n_teams: 2
-  # Torso vertical crop ratio within player bounding box for jersey color extraction
+  # Upper-body (torso) crop inside each player bounding box, as fractions of
+  # the box. This is what keeps grass, legs and most background out of the
+  # colour sample.
   torso_crop_top: 0.2
   torso_crop_bottom: 0.6
+  # Columns trimmed on each side of the box (arms / background bleeding in)
+  torso_crop_side: 0.15
+
+  # --- dominant jersey colour extraction --- #
+  # Pixel clusters used to find the crop's dominant colour region
+  n_dominant_colors: 3
+  # Crops smaller than this many pixels are ignored (far-away players)
+  min_crop_pixels: 40
+  # Large crops are subsampled to this many pixels (constant cost per player)
+  max_crop_pixels: 512
+  # The dominant region must cover at least this share of the crop, otherwise
+  # the observation is rejected (occlusion, advertisement boards in the box).
+  # Raise towards 0.6 if ads/background are leaking into the jersey colour.
+  min_dominant_ratio: 0.45
+  # Weight of brightness (V) in the colour feature: lower = more robust to
+  # shadows, higher = better white-vs-black kit separation
+  value_weight: 0.5
+  # Lloyd iterations for the per-crop dominant colour
+  pixel_kmeans_iters: 6
+
+  # --- two-team clustering --- #
+  # Frames between colour-model refits (keeps TEAM_A/TEAM_B meanings stable)
+  recluster_interval: 15
+  # Pooled observations / distinct players required before the first fit
+  min_cluster_samples: 40
+  min_cluster_tracks: 4
+  # Caps keeping clustering cheap
+  max_cluster_samples: 4000
+  max_samples_per_track: 12
+  # k-means effort for the team clustering itself
+  kmeans_iters: 25
+  kmeans_restarts: 3
+  # Clusters closer than this multiple of their own spread count as one blob
+  # (similar kits) -> no model, everyone stays UNKNOWN instead of being split
+  # arbitrarily. Lower to ~2.0 if teams with close colours stay UNKNOWN.
+  min_separation_ratio: 3.0
+  # Per-cluster radius floor as a fraction of the cluster separation
+  radius_floor_ratio: 0.05
+
+  # --- assignment + temporal smoothing --- #
+  # Rolling observation window kept per player
+  feature_history: 32
+  # Recent observations averaged when deciding the current team
+  mean_window: 10
+  # Uncertainty gates (relative to the clustered data, not fixed colours):
+  #   radius - too far from the nearest team -> UNKNOWN (referee, goalkeeper,
+  #           odd kit, advertisement colour)
+  #   margin - almost equally close to both teams -> UNKNOWN (similar kits)
+  # Raise the radius scale to label more players, lower it to be stricter.
+  unknown_radius_scale: 2.5
+  unknown_margin_ratio: 0.75
+  # Consecutive agreeing frames before a team is committed to a player, and
+  # consecutive contradicting frames before it may be switched. Higher values
+  # = more stable IDs, slower to react.
+  min_consistent_frames: 5
+  switch_frames: 8
+  # Seed for the clustering (deterministic output for a given clip)
+  random_seed: 0
 
 # 2D Pitch mapping configuration (Standard FIFA pitch dimensions in meters)
 pitch:

@@ -95,6 +95,12 @@ def count_ball_marker_pixels(frame: np.ndarray) -> int:
     return int(((g > 170) & (r > 170) & (b < 110)).sum())
 
 
+def count_color_pixels(frame: np.ndarray, bgr: tuple[int, int, int], tol: int = 25) -> int:
+    """Pixels close to an exact BGR colour (marker / legend colours)."""
+    b, g, r = frame[:, :, 0].astype(int), frame[:, :, 1].astype(int), frame[:, :, 2].astype(int)
+    return int(((abs(b - bgr[0]) < tol) & (abs(g - bgr[1]) < tol) & (abs(r - bgr[2]) < tol)).sum())
+
+
 def test_pipeline_writes_annotated_video(tmp_path: Path):
     input_path = write_test_video(tmp_path / "input.mp4")
     output_path = tmp_path / "annotated.mp4"
@@ -269,3 +275,157 @@ def test_pipeline_exports_tracking_csv(tmp_path: Path):
     reloaded = TrackLog.from_csv(csv_path)
     assert len(reloaded) == 10
     assert reloaded.records[0].center == pytest.approx((30.0, 130.0))
+
+
+# ---------------------------------------------------------------------- #
+# Stage 3: team classification end-to-end
+# ---------------------------------------------------------------------- #
+
+# Kits in the synthetic footage - deliberately *not* the annotation colours.
+KIT_A_BGR = (200, 70, 40)   # blue-ish
+KIT_B_BGR = (40, 45, 200)   # red-ish
+
+TWO_TEAM_BOXES = [
+    (40.0, 60.0, 90.0, 200.0),     # kit A
+    (130.0, 60.0, 180.0, 200.0),   # kit A
+    (300.0, 60.0, 350.0, 200.0),   # kit B
+    (390.0, 60.0, 440.0, 200.0),   # kit B
+]
+TWO_TEAM_FRAMES = 40
+
+
+class BoxStubDetector:
+    """Deterministic detector: always reports the four fixed boxes."""
+
+    def __init__(self, boxes):
+        self.boxes = boxes
+        self.load_count = 0
+
+    def load_model(self) -> None:
+        self.load_count += 1
+
+    def detect(self, frame: np.ndarray) -> List[Detection]:
+        return [
+            Detection(bbox=b, confidence=0.9, class_id=0, class_name="player")
+            for b in self.boxes
+        ]
+
+
+# The two-team boxes span x=40..440, so this clip needs a wider frame than the
+# single-player default: with FRAME_SIZE the kit-B team fell outside the image
+# and those players could never yield a jersey colour.
+TWO_TEAM_FRAME_SIZE = (480, 240)
+
+# Frame from which teams are considered committed: the clustering round needs
+# min_cluster_samples across min_cluster_tracks tracks, then the assignment
+# must hold for min_consistent_frames frames (0-based).
+TEAM_SETTLE_FRAME = 20
+
+
+def write_two_team_video(path: Path, frames: int = TWO_TEAM_FRAMES) -> Path:
+    """Static four-player clip: two players per kit on a grass background."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), FPS, TWO_TEAM_FRAME_SIZE
+    )
+    assert writer.isOpened(), f"Could not open test video writer for {path}"
+    for _ in range(frames):
+        frame = np.full(
+            (TWO_TEAM_FRAME_SIZE[1], TWO_TEAM_FRAME_SIZE[0], 3), (45, 110, 45), dtype=np.uint8
+        )
+        for index, (x1, y1, x2, y2) in enumerate(TWO_TEAM_BOXES):
+            color = KIT_A_BGR if index < 2 else KIT_B_BGR
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, -1)
+        writer.write(frame)
+    writer.release()
+    return path
+
+
+def test_pipeline_classifies_two_teams_end_to_end(tmp_path: Path):
+    """Raw clip in -> per-frame team records + per-team colours + legend out."""
+    input_path = write_two_team_video(tmp_path / "two_teams.mp4")
+    output_path = tmp_path / "annotated.mp4"
+
+    stats = TacticalPipeline(
+        make_config(input_path, output_path), detector=BoxStubDetector(TWO_TEAM_BOXES)
+    ).run()
+
+    # One team record per tracked player per frame.
+    assert len(stats.team_log) == 4 * TWO_TEAM_FRAMES
+    assert stats.team_log.frames == set(range(TWO_TEAM_FRAMES))
+
+    # Every player is classified (no UNKNOWN) once the model has settled.
+    final_frame = TWO_TEAM_FRAMES - 1
+    teams = {r.player_id: r.team for r in stats.team_log.for_frame(final_frame)}
+    assert set(teams.values()) <= {"TEAM_A", "TEAM_B"}
+
+    # Over the whole run each of the four players ends up on exactly one team:
+    # two unique players per label (a mid-run switch would push the sum past 4)
+    # and nobody stays UNKNOWN - only the warm-up frames before the first
+    # commitment are labelled UNKNOWN.
+    counts = stats.team_log.team_counts
+    assert counts["TEAM_A"] == 2 and counts["TEAM_B"] == 2, counts
+    ever_labeled = {r.player_id for r in stats.team_log if r.team in ("TEAM_A", "TEAM_B")}
+    assert ever_labeled == {r.player_id for r in stats.team_log}, counts
+
+    # The split follows the *kits*, not the geometry: the two left boxes share
+    # one team and the two right boxes the other (which is which is decided
+    # by the clustering).
+    centers = {r.player_id: r.cx for r in stats.track_log.for_frame(final_frame)}
+    left = [pid for pid, cx in centers.items() if cx < 250]
+    right = [pid for pid, cx in centers.items() if cx >= 250]
+    assert len(left) == 2 and len(right) == 2
+    assert len({teams[pid] for pid in left}) == 1, f"kit A split: {teams}"
+    assert len({teams[pid] for pid in right}) == 1, f"kit B split: {teams}"
+    assert teams[left[0]] != teams[right[0]], "the two kits must differ"
+
+
+def test_pipeline_writes_team_csv_with_documented_columns(tmp_path: Path):
+    input_path = write_two_team_video(tmp_path / "two_teams.mp4")
+    stats = TacticalPipeline(
+        make_config(input_path, tmp_path / "out.mp4"), detector=BoxStubDetector(TWO_TEAM_BOXES)
+    ).run()
+
+    csv_path = stats.team_log.save_csv(tmp_path / "nested" / "teams.csv")
+    with open(csv_path, newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+
+    assert rows[0] == ["frame", "timestamp", "player_id", "team", "cx", "cy"]
+    assert len(rows) == 1 + 4 * TWO_TEAM_FRAMES
+    assert {row[3] for row in rows[1:]} <= {"TEAM_A", "TEAM_B", "UNKNOWN"}
+    assert float(rows[1][1]) == pytest.approx(0.0)
+    # Rows line up with the Stage 2 tracking CSV (same frame, same centre).
+    track_rows = {r.player_id: r for r in stats.track_log.for_frame(0)}
+    for row in rows[1:6]:
+        record = track_rows[int(row[2])]
+        assert float(row[4]) == pytest.approx(record.cx)
+        assert float(row[5]) == pytest.approx(record.cy)
+
+
+def test_pipeline_draws_per_team_colours_and_legend(tmp_path: Path):
+    """Team A / Team B players are annotated in different colours + legend."""
+    input_path = write_two_team_video(tmp_path / "two_teams.mp4")
+    output_path = tmp_path / "annotated.mp4"
+
+    TacticalPipeline(
+        make_config(input_path, output_path), detector=BoxStubDetector(TWO_TEAM_BOXES)
+    ).run()
+
+    from app.visualization import COLOR_TEAM_A, COLOR_TEAM_B
+
+    # Teams are only coloured in once they are committed (cluster fit +
+    # min_consistent_frames), so inspect a settled frame, not frame 0.
+    with VideoReader(output_path) as reader:
+        frames = reader.read_frames()
+        for _ in range(TEAM_SETTLE_FRAME):
+            _, frame = next(frames)
+
+    # Markers + legend swatches use both team colours, the kits themselves do
+    # not, so any hit above comes from the annotations.
+    assert count_color_pixels(frame, COLOR_TEAM_A) > 50, "Team A colour missing"
+    assert count_color_pixels(frame, COLOR_TEAM_B) > 50, "Team B colour missing"
+
+    # The legend lives in the top-right corner.
+    legend = frame[:100, frame.shape[1] - 140:]
+    assert count_color_pixels(legend, COLOR_TEAM_A) > 50
+    assert count_color_pixels(legend, COLOR_TEAM_B) > 50

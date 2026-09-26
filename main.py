@@ -10,6 +10,7 @@ the detection -> tracking -> visualization pipeline over a raw video:
     python main.py                       # run with config.yaml defaults
     python main.py --input my_match.mp4  # run on your own footage
     python main.py --track-csv           # also export per-frame tracking data
+    python main.py --team-csv            # also export per-frame team labels
     python main.py --check-only          # only verify the environment
 """
 
@@ -91,6 +92,18 @@ def parse_arguments() -> argparse.Namespace:
             "Optionally pass a path (default: output/tracks.csv)."
         ),
     )
+    parser.add_argument(
+        "--team-csv",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Save per-frame team assignments as CSV with columns "
+            "frame,timestamp,player_id,team,cx,cy (team is TEAM_A, TEAM_B "
+            "or UNKNOWN). Optionally pass a path (default: output/teams.csv)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -101,6 +114,15 @@ def resolve_track_csv_path(config: AppConfig, args: argparse.Namespace) -> Optio
     if args.track_csv:
         return Path(args.track_csv).expanduser().resolve()
     return config.project_root / "output" / "tracks.csv"
+
+
+def resolve_team_csv_path(config: AppConfig, args: argparse.Namespace) -> Optional[Path]:
+    """Return the CSV destination requested by --team-csv, or None when not asked for."""
+    if args.team_csv is None:
+        return None
+    if args.team_csv:
+        return Path(args.team_csv).expanduser().resolve()
+    return config.project_root / "output" / "teams.csv"
 
 
 def apply_overrides(config: AppConfig, args: argparse.Namespace) -> None:
@@ -257,13 +279,14 @@ def print_summary(
     print(f"  Default Input    : {config.video.input_path}")
     print(f"  Default Output   : {config.video.output_path}")
     print(f"  Tracker Type     : {config.tracker.tracker_type}")
+    print(f"  Team Model       : {config.team_classifier.n_teams}-way jersey colour clustering")
     print(border)
 
     if all_ok:
         logger.info("SUCCESS: All core libraries and configurations are verified!")
         print("\n[READY] Environment is verified.")
         print("Next: run a video through the pipeline with 'python main.py --input <video.mp4>'.")
-        print("Not implemented yet: team classification, pitch homography, formations, passing lanes.")
+        print("Not implemented yet: pitch homography, formations, passing lanes.")
     else:
         logger.warning("ATTENTION: Some dependencies are missing.")
         print("\nPlease activate your virtual environment and run:")
@@ -306,6 +329,7 @@ def main() -> int:
     from app.pipeline import TacticalPipeline
 
     track_csv_path = resolve_track_csv_path(config, args)
+    team_csv_path = resolve_team_csv_path(config, args)
     logger.info(
         "Starting pipeline: %s -> %s",
         config.video.input_path,
@@ -313,6 +337,8 @@ def main() -> int:
     )
     if track_csv_path is not None:
         logger.info("Tracking records will also be written to %s", track_csv_path)
+    if team_csv_path is not None:
+        logger.info("Team assignments will also be written to %s", team_csv_path)
 
     try:
         stats = TacticalPipeline(config).run(
@@ -326,7 +352,7 @@ def main() -> int:
         logger.exception("Pipeline failed")
         return 1
 
-    # 6. Optionally export the per-frame tracking records as CSV.
+    # 6. Optionally export the per-frame tracking / team records as CSV.
     if track_csv_path is not None:
         saved = stats.track_log.save_csv(track_csv_path)
         logger.info(
@@ -334,6 +360,17 @@ def main() -> int:
             len(stats.track_log),
             len(stats.track_log.unique_ids),
             saved,
+        )
+    if team_csv_path is not None:
+        saved = stats.team_log.save_csv(team_csv_path)
+        counts = stats.team_log.team_counts
+        logger.info(
+            "Saved %d team records to %s (TEAM_A=%d, TEAM_B=%d, UNKNOWN=%d unique players)",
+            len(stats.team_log),
+            saved,
+            counts["TEAM_A"],
+            counts["TEAM_B"],
+            counts["UNKNOWN"],
         )
 
     return 0

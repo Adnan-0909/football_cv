@@ -23,12 +23,22 @@ logger = logging.getLogger(__name__)
 
 
 # Standard Tactical Color Palette (BGR for OpenCV)
+# TEAM_A / TEAM_B colours are *annotation* colours (which real kit maps to
+# which team is decided by clustering, never by a fixed colour rule).
 COLOR_TEAM_A = (255, 60, 0)      # Blueish
 COLOR_TEAM_B = (0, 165, 255)     # Orange
+COLOR_UNKNOWN = (255, 255, 255)  # Neutral white for unclassified players
 COLOR_BALL = (0, 255, 255)       # Yellow
 COLOR_REFEREE = (0, 255, 0)      # Green
 COLOR_LANE_OPEN = (50, 205, 50)  # Lime Green
 COLOR_LANE_BLOCKED = (0, 0, 255) # Red
+
+# Legend entries: label -> swatch colour (mirrors app.team_classifier labels).
+TEAM_LEGEND_COLORS: Tuple[Tuple[str, Tuple[int, int, int]], ...] = (
+    ("TEAM_A", COLOR_TEAM_A),
+    ("TEAM_B", COLOR_TEAM_B),
+    ("UNKNOWN", COLOR_UNKNOWN),
+)
 
 
 class TacticalVisualizer:
@@ -154,6 +164,55 @@ class TacticalVisualizer:
             np.int32,
         )
         cv2.drawContours(frame, [pts], 0, color, -1)
+        return frame
+
+    def draw_team_legend(
+        self,
+        frame: np.ndarray,
+        counts: Optional[Dict[str, int]] = None,
+    ) -> np.ndarray:
+        """
+        Draw the team colour legend (swatch + label + player count).
+
+        The legend is what makes the per-team annotations readable: Team A and
+        Team B players are drawn in their own marker colours, unclassified
+        players stay neutral, and the counts show how many of each are visible
+        right now.
+
+        Args:
+            frame: Video frame image.
+            counts: Optional ``{"TEAM_A": n, "TEAM_B": n, "UNKNOWN": n}``.
+
+        Returns:
+            np.ndarray: Frame with the legend in the top-right corner.
+        """
+        counts = counts or {}
+        row_h, pad, swatch = 22, 6, 14
+        panel_w, panel_h = 132, pad * 2 + row_h * len(TEAM_LEGEND_COLORS)
+        frame_h, frame_w = frame.shape[:2]
+        x0 = max(4, frame_w - panel_w - 8)
+        y0 = 8
+
+        # Opaque dark panel keeps the legend readable over grass and crowds.
+        cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y0 + panel_h), (25, 25, 25), -1)
+
+        for i, (label, color) in enumerate(TEAM_LEGEND_COLORS):
+            y = y0 + pad + i * row_h
+            cv2.rectangle(frame, (x0 + 8, y), (x0 + 8 + swatch, y + swatch), color, -1)
+            cv2.rectangle(frame, (x0 + 8, y), (x0 + 8 + swatch, y + swatch), (0, 0, 0), 1)
+            text = f"{label} {int(counts.get(label, 0))}"
+            tx, ty = x0 + 8 + swatch + 8, y + swatch - 2
+            # Same 1px outline trick as the ID labels (a thick pass would
+            # widen the glyph advance and ghost the text).
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                cv2.putText(
+                    frame, text, (tx + dx, ty + dy), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, (0, 0, 0), 1, cv2.LINE_AA,
+                )
+            cv2.putText(
+                frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                (255, 255, 255), 1, cv2.LINE_AA,
+            )
         return frame
 
     def draw_team_connections(

@@ -57,9 +57,68 @@ class TrackerConfig:
 @dataclass
 class TeamClassifierConfig:
     """Settings for team identification using jersey color clustering."""
+    # Number of clusters: 2 teams (TEAM_A / TEAM_B), everything else UNKNOWN.
     n_teams: int = 2
+    # Upper-body (torso) crop inside each player bounding box. Expressed as a
+    # fraction of the box, so it adapts to players of any size on screen.
     torso_crop_top: float = 0.2
     torso_crop_bottom: float = 0.6
+    # Columns trimmed on each side of the box (background / arms bleeding in).
+    torso_crop_side: float = 0.15
+
+    # --- dominant jersey colour extraction -------------------------------- #
+    # Pixel clusters used to find the dominant colour region of the crop.
+    n_dominant_colors: int = 3
+    # Crops smaller than this many pixels are ignored (far-away players).
+    min_crop_pixels: int = 40
+    # Very large crops are subsampled to this many pixels (constant cost).
+    max_crop_pixels: int = 512
+    # The dominant region must cover at least this share of the crop, else the
+    # observation is rejected (occlusion, advertisements / background).
+    min_dominant_ratio: float = 0.45
+    # Weight of brightness (V) in the 3-D colour feature. Lower = more robust
+    # to shadows, higher = better white-vs-black separation.
+    value_weight: float = 0.5
+    # Lloyd iterations for the per-crop dominant colour.
+    pixel_kmeans_iters: int = 6
+
+    # --- two-team clustering --------------------------------------------- #
+    # Frames between colour-model refits (keeps TEAM_A/TEAM_B meanings stable).
+    recluster_interval: int = 15
+    # Minimum pooled observations / distinct tracks before the first fit.
+    min_cluster_samples: int = 40
+    min_cluster_tracks: int = 4
+    # Caps keeping one clip cheap: pool at most this many samples in total,
+    # taking at most this many recent features per player.
+    max_cluster_samples: int = 4000
+    max_samples_per_track: int = 12
+    # k-means effort for the team clustering itself.
+    kmeans_iters: int = 25
+    kmeans_restarts: int = 3
+    # Clusters closer than this multiple of their own spread are considered
+    # one blob (similar kits) -> the model is refused and everyone stays
+    # UNKNOWN instead of being split arbitrarily.
+    min_separation_ratio: float = 3.0
+    # Per-cluster radius is floored at this fraction of the separation so an
+    # extremely tight cluster cannot reject everything as "too far".
+    radius_floor_ratio: float = 0.05
+
+    # --- assignment + temporal smoothing ---------------------------------- #
+    # Rolling observation window per player (frames kept for the mean colour).
+    feature_history: int = 32
+    # Recent observations averaged when deciding the current team.
+    mean_window: int = 10
+    # Uncertainty gates (both relative to the clustered data, never fixed
+    # colours): too far from the nearest team -> UNKNOWN (referee, keeper,
+    # odd kit); almost equally close to both -> UNKNOWN (similar kits).
+    unknown_radius_scale: float = 2.5
+    unknown_margin_ratio: float = 0.75
+    # Consecutive agreeing frames before a team is committed to a player...
+    min_consistent_frames: int = 5
+    # ...and consecutive contradicting frames before it may be switched.
+    switch_frames: int = 8
+    # Seed for the clustering (deterministic output for a given clip).
+    random_seed: int = 0
 
 
 @dataclass
@@ -171,6 +230,29 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> AppConfig:
         n_teams=int(tc_raw.get("n_teams", 2)),
         torso_crop_top=float(tc_raw.get("torso_crop_top", 0.2)),
         torso_crop_bottom=float(tc_raw.get("torso_crop_bottom", 0.6)),
+        torso_crop_side=float(tc_raw.get("torso_crop_side", 0.15)),
+        n_dominant_colors=int(tc_raw.get("n_dominant_colors", 3)),
+        min_crop_pixels=int(tc_raw.get("min_crop_pixels", 40)),
+        max_crop_pixels=int(tc_raw.get("max_crop_pixels", 512)),
+        min_dominant_ratio=float(tc_raw.get("min_dominant_ratio", 0.45)),
+        value_weight=float(tc_raw.get("value_weight", 0.5)),
+        pixel_kmeans_iters=int(tc_raw.get("pixel_kmeans_iters", 6)),
+        recluster_interval=int(tc_raw.get("recluster_interval", 15)),
+        min_cluster_samples=int(tc_raw.get("min_cluster_samples", 40)),
+        min_cluster_tracks=int(tc_raw.get("min_cluster_tracks", 4)),
+        max_cluster_samples=int(tc_raw.get("max_cluster_samples", 4000)),
+        max_samples_per_track=int(tc_raw.get("max_samples_per_track", 12)),
+        kmeans_iters=int(tc_raw.get("kmeans_iters", 25)),
+        kmeans_restarts=int(tc_raw.get("kmeans_restarts", 3)),
+        min_separation_ratio=float(tc_raw.get("min_separation_ratio", 3.0)),
+        radius_floor_ratio=float(tc_raw.get("radius_floor_ratio", 0.05)),
+        feature_history=int(tc_raw.get("feature_history", 32)),
+        mean_window=int(tc_raw.get("mean_window", 10)),
+        unknown_radius_scale=float(tc_raw.get("unknown_radius_scale", 2.5)),
+        unknown_margin_ratio=float(tc_raw.get("unknown_margin_ratio", 0.75)),
+        min_consistent_frames=int(tc_raw.get("min_consistent_frames", 5)),
+        switch_frames=int(tc_raw.get("switch_frames", 8)),
+        random_seed=int(tc_raw.get("random_seed", 0)),
     )
 
     # Parse PitchConfig

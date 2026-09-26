@@ -7,10 +7,14 @@ Connects the individual stages into a runnable end-to-end flow:
     raw MP4 -> VideoReader -> FootballDetector -> PlayerTracker
             -> (optional stages) -> TacticalVisualizer -> VideoWriter
 
-Stages that are still scaffolds (team classification, homography, formations,
-passing lanes) are probed once at startup; if they raise ``NotImplementedError``
+Stages that are still scaffolds (pitch homography, formations, passing lanes)
+are probed once at startup; if they raise ``NotImplementedError``
 they are skipped with a single log line instead of crashing the run, so the
 pipeline starts working automatically as they get implemented.
+
+Stage 3 (team classification) lives in :mod:`app.team_classifier`: every
+tracked player gets TEAM_A / TEAM_B / UNKNOWN, drawn in a per-team colour with
+a legend, and exported per frame through :mod:`app.team_log`.
 """
 
 from __future__ import annotations
@@ -26,13 +30,15 @@ import numpy as np
 
 from app.config import AppConfig
 from app.detector import FootballDetector, Detection
+from app.team_classifier import TEAM_A, TEAM_B, TeamClassifier, team_label
+from app.team_log import TeamLog
 from app.tracker import PlayerTracker, TrackedObject
 from app.track_log import TrackLog
 from app.video import VideoReader, VideoWriter
-from app.visualization import COLOR_BALL, COLOR_TEAM_A, COLOR_TEAM_B, TacticalVisualizer
+from app.visualization import COLOR_BALL, COLOR_TEAM_A, COLOR_TEAM_B, COLOR_UNKNOWN, TacticalVisualizer
 
-# Fallback marker colour until team classification is implemented.
-COLOR_UNKNOWN_PLAYER = (255, 255, 255)
+# Marker colour for players whose team is not (yet) known.
+COLOR_UNKNOWN_PLAYER = COLOR_UNKNOWN
 
 # Progress is logged every N processed frames.
 LOG_EVERY_N_FRAMES = 50
@@ -55,6 +61,10 @@ class PipelineStats:
     # {frame, timestamp, player_id, bbox, center} - exportable with
     # TrackLog.save_csv() (see also the --track-csv flag in main.py).
     track_log: TrackLog = field(default_factory=TrackLog)
+    # One record per tracked player per frame with the Stage 3 team label:
+    # {frame, timestamp, player_id, team, center} - exportable with
+    # TeamLog.save_csv() (see also the --team-csv flag in main.py).
+    team_log: TeamLog = field(default_factory=TeamLog)
 
     @property
     def processing_fps(self) -> float:
@@ -107,9 +117,9 @@ class TacticalPipeline:
         self.visualizer = visualizer if visualizer is not None else TacticalVisualizer()
         self.logger = logging.getLogger("football_tracker.pipeline")
 
-        # Filled by _update_teams(): team_id per track_id, once the team
-        # classifier exists. Empty for now.
-        self.team_by_track: Dict[int, int] = {}
+        # Filled by _update_teams(): team_id (TEAM_A/TEAM_B/None) per track_id,
+        # persisted across frames so assignments never flicker.
+        self.team_by_track: Dict[int, Optional[int]] = {}
         self._team_stage_enabled = False
         self._team_classifier = None
 
@@ -169,9 +179,18 @@ class TacticalPipeline:
                     tracks = self.tracker.update(self._tracker_inputs(detections), frame)
 
                     timestamp = frame_index / source_fps
+                    # Stage 3: cluster jersey colours and assign teams first,
+                    # so the annotation and the team log use the same labels.
+                    self._update_teams(frame, tracks, frame_index)
                     for track in tracks:
                         if track.class_name == "player":
                             stats.track_log.add_track(frame_index, timestamp, track)
+                            stats.team_log.add_team(
+                                frame_index,
+                                timestamp,
+                                track,
+                                self.team_by_track.get(track.track_id),
+                            )
 
                     writer.write(self._annotate(frame, detections, tracks, frame_index))
 
@@ -193,6 +212,12 @@ class TacticalPipeline:
                         )
 
         stats.elapsed_seconds = time.perf_counter() - started
+        if len(stats.team_log):
+            counts = stats.team_log.team_counts
+            self.logger.info(
+                "Team assignments: TEAM_A=%d TEAM_B=%d UNKNOWN=%d (unique players)",
+                counts["TEAM_A"], counts["TEAM_B"], counts["UNKNOWN"],
+            )
         self.logger.info("Pipeline finished: %s", stats.summary())
         return stats
 
@@ -205,14 +230,13 @@ class TacticalPipeline:
         Check once which optional stages are implemented.
 
         Stage stubs raise ``NotImplementedError``; that is logged a single time
-        and the stage is skipped for the rest of the run.
+        and the stage is skipped for the rest of the run. The probe instance is
+        kept and reused for the whole run, so observations are never lost.
         """
-        from app.team_classifier import TeamClassifier
-
-        classifier = TeamClassifier(self.config.team_classifier)
+        self._team_classifier = TeamClassifier(self.config.team_classifier)
+        dummy = TrackedObject(track_id=-1, bbox=(0.0, 0.0, 1.0, 1.0), class_id=0, class_name="player")
         try:
-            dummy = TrackedObject(track_id=-1, bbox=(0.0, 0.0, 1.0, 1.0), class_id=0, class_name="player")
-            classifier.predict_team(np.zeros((2, 2, 3), dtype=np.uint8), dummy)
+            self._team_classifier.predict_team(np.zeros((2, 2, 3), dtype=np.uint8), dummy)
             self._team_stage_enabled = True
             self.logger.info("Team classification stage is available - enabled.")
         except NotImplementedError:
@@ -222,23 +246,32 @@ class TacticalPipeline:
                 "players will be drawn in a neutral colour."
             )
 
-    def _update_teams(self, frame: np.ndarray, tracks: List[TrackedObject]) -> None:
-        """Assign a team to every tracked player (no-op until the stage exists)."""
+    def _update_teams(
+        self,
+        frame: np.ndarray,
+        tracks: List[TrackedObject],
+        frame_index: int,
+    ) -> None:
+        """
+        Assign a team to every tracked player of this frame (Stage 3).
+
+        The jersey-colour model is refreshed and the temporally smoothed
+        assignments are merged into ``self.team_by_track`` (keyed by track ID,
+        so a player keeps its team across frames).
+        """
         if not self._team_stage_enabled:
             return
-        from app.team_classifier import TeamClassifier
-
         if self._team_classifier is None:
             self._team_classifier = TeamClassifier(self.config.team_classifier)
-        for track in tracks:
-            if track.class_name != "player":
-                continue
-            try:
-                self.team_by_track[track.track_id] = self._team_classifier.predict_team(frame, track)
-            except NotImplementedError:  # pragma: no cover - stage appears mid-run
-                self._team_stage_enabled = False
-                self.logger.info("Team classification became unavailable - disabling the stage.")
-                return
+
+        players = [track for track in tracks if track.class_name == "player"]
+        try:
+            self.team_by_track.update(
+                self._team_classifier.predict_teams(frame, players, frame_index)
+            )
+        except NotImplementedError:  # pragma: no cover - stage appears mid-run
+            self._team_stage_enabled = False
+            self.logger.info("Team classification became unavailable - disabling the stage.")
 
     def _tracker_inputs(self, detections: List[Detection]) -> List[Detection]:
         """
@@ -260,9 +293,7 @@ class TacticalPipeline:
         tracks: List[TrackedObject],
         frame_index: int,
     ) -> np.ndarray:
-        """Draw boxes, IDs, trails, and a small HUD onto the frame."""
-        self._update_teams(frame, tracks)
-
+        """Draw boxes, IDs, trails, team legend, and a small HUD onto the frame."""
         players = 0
         ball_tracked = False
         for track in tracks:
@@ -288,15 +319,29 @@ class TacticalPipeline:
                 if detection.class_name == "ball":
                     self.visualizer.draw_ball_marker(frame, detection.bbox, COLOR_BALL)
 
+        # Stage 3: show which colour means which team, with live counts.
+        if self._team_stage_enabled and players:
+            self.visualizer.draw_team_legend(frame, self._team_counts(tracks))
+
         self._draw_hud(frame, frame_index, len(detections), players, len(tracks))
         return frame
+
+    def _team_counts(self, tracks: List[TrackedObject]) -> Dict[str, int]:
+        """Visible players per team label (TEAM_A / TEAM_B / UNKNOWN)."""
+        counts = {"TEAM_A": 0, "TEAM_B": 0, "UNKNOWN": 0}
+        for track in tracks:
+            if track.class_name == "player":
+                counts[team_label(self.team_by_track.get(track.track_id))] += 1
+        return counts
 
     def _color_for(self, track: TrackedObject) -> tuple[int, int, int]:
         """Team colour for a player, or a neutral colour until teams are known."""
         team = self.team_by_track.get(track.track_id)
-        if team is None:
-            return COLOR_UNKNOWN_PLAYER
-        return COLOR_TEAM_A if team % 2 == 0 else COLOR_TEAM_B
+        if team == TEAM_A:
+            return COLOR_TEAM_A
+        if team == TEAM_B:
+            return COLOR_TEAM_B
+        return COLOR_UNKNOWN_PLAYER
 
     @staticmethod
     def _draw_trail(frame: np.ndarray, track: TrackedObject, color: tuple[int, int, int]) -> None:
