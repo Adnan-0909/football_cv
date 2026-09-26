@@ -123,9 +123,22 @@ class TeamClassifierConfig:
 
 @dataclass
 class PitchConfig:
-    """Settings for 2D tactical pitch dimensions and coordinate mapping."""
+    """Settings for 2D tactical pitch dimensions and coordinate mapping (Stage 4).
+
+    The coordinate system is meters with the origin at one corner of the
+    pitch: x runs along the length (0 -> ``length_meters``), y along the width
+    (0 -> ``width_meters``). See app/pitch.py for the full convention.
+    """
     length_meters: float = 105.0
     width_meters: float = 68.0
+    # Manual calibration file (image <-> pitch correspondences + homography).
+    # Relative paths resolve against the project root. The pitch stage only
+    # runs when this file exists - create it with: python main.py --calibrate
+    calibration_path: Path = Path("calibration/pitch.json")
+    # Minimum number of image/pitch point pairs accepted by findHomography().
+    min_points: int = 4
+    # Draw the top-down radar inset on the annotated video (needs calibration).
+    show_radar: bool = True
 
 
 @dataclass
@@ -260,6 +273,11 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> AppConfig:
     pitch_cfg = PitchConfig(
         length_meters=float(p_raw.get("length_meters", 105.0)),
         width_meters=float(p_raw.get("width_meters", 68.0)),
+        calibration_path=_resolve_path(
+            str(p_raw.get("calibration_path", "calibration/pitch.json")), PROJECT_ROOT
+        ),
+        min_points=int(p_raw.get("min_points", 4)),
+        show_radar=bool(p_raw.get("show_radar", True)),
     )
 
     # Parse LoggingConfig

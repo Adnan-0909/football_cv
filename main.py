@@ -11,6 +11,8 @@ the detection -> tracking -> visualization pipeline over a raw video:
     python main.py --input my_match.mp4  # run on your own footage
     python main.py --track-csv           # also export per-frame tracking data
     python main.py --team-csv            # also export per-frame team labels
+    python main.py --pitch-csv           # also export pitch coords (meters)
+    python main.py --calibrate           # interactive Stage 4 homography setup
     python main.py --check-only          # only verify the environment
 """
 
@@ -104,6 +106,35 @@ def parse_arguments() -> argparse.Namespace:
             "or UNKNOWN). Optionally pass a path (default: output/teams.csv)."
         ),
     )
+    parser.add_argument(
+        "--pitch-csv",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Save per-frame top-down pitch positions (meters) as CSV with columns "
+            "frame,timestamp,player_id,team,pitch_x,pitch_y. Requires a "
+            "calibration (--calibrate). Optionally pass a path "
+            "(default: output/pitch.csv)."
+        ),
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help=(
+            "Interactive Stage 4 calibration: click corresponding points on a "
+            "video frame and on a standardized pitch diagram to build the "
+            "image->pitch homography, then exit."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-frame",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Frame index used by --calibrate (default: middle of the video).",
+    )
     return parser.parse_args()
 
 
@@ -123,6 +154,15 @@ def resolve_team_csv_path(config: AppConfig, args: argparse.Namespace) -> Option
     if args.team_csv:
         return Path(args.team_csv).expanduser().resolve()
     return config.project_root / "output" / "teams.csv"
+
+
+def resolve_pitch_csv_path(config: AppConfig, args: argparse.Namespace) -> Optional[Path]:
+    """Return the CSV destination requested by --pitch-csv, or None when not asked for."""
+    if args.pitch_csv is None:
+        return None
+    if args.pitch_csv:
+        return Path(args.pitch_csv).expanduser().resolve()
+    return config.project_root / "output" / "pitch.csv"
 
 
 def apply_overrides(config: AppConfig, args: argparse.Namespace) -> None:
@@ -286,7 +326,8 @@ def print_summary(
         logger.info("SUCCESS: All core libraries and configurations are verified!")
         print("\n[READY] Environment is verified.")
         print("Next: run a video through the pipeline with 'python main.py --input <video.mp4>'.")
-        print("Not implemented yet: pitch homography, formations, passing lanes.")
+        print("Stage 4 pitch mapping: run 'python main.py --calibrate' once per video.")
+        print("Not implemented yet: formations, passing lanes.")
     else:
         logger.warning("ATTENTION: Some dependencies are missing.")
         print("\nPlease activate your virtual environment and run:")
@@ -325,11 +366,36 @@ def main() -> int:
         logger.info("--check-only requested: skipping video processing.")
         return 0
 
+    # 4b. Interactive Stage 4 calibration: build the homography and exit.
+    if args.calibrate:
+        from app.calibration import run_calibration
+
+        logger.info(
+            "Starting interactive pitch calibration for %s -> %s",
+            config.video.input_path,
+            config.pitch.calibration_path,
+        )
+        try:
+            saved = run_calibration(
+                config.pitch, config.video.input_path, args.calibration_frame
+            )
+        except (FileNotFoundError, IOError, RuntimeError) as exc:
+            logger.error("%s", exc)
+            return 1
+        if saved is None:
+            logger.info("Calibration cancelled - no video processing done.")
+            return 1
+        logger.info(
+            "Calibration saved. Re-run without --calibrate to enable the pitch radar/pitch CSV."
+        )
+        return 0
+
     # 5. Run the detection + tracking + annotation pipeline
     from app.pipeline import TacticalPipeline
 
     track_csv_path = resolve_track_csv_path(config, args)
     team_csv_path = resolve_team_csv_path(config, args)
+    pitch_csv_path = resolve_pitch_csv_path(config, args)
     logger.info(
         "Starting pipeline: %s -> %s",
         config.video.input_path,
@@ -339,6 +405,8 @@ def main() -> int:
         logger.info("Tracking records will also be written to %s", track_csv_path)
     if team_csv_path is not None:
         logger.info("Team assignments will also be written to %s", team_csv_path)
+    if pitch_csv_path is not None:
+        logger.info("Pitch positions will also be written to %s", pitch_csv_path)
 
     try:
         stats = TacticalPipeline(config).run(
@@ -371,6 +439,16 @@ def main() -> int:
             counts["TEAM_A"],
             counts["TEAM_B"],
             counts["UNKNOWN"],
+        )
+    if pitch_csv_path is not None:
+        saved = stats.pitch_log.save_csv(pitch_csv_path)
+        logger.info(
+            "Saved %d pitch records (%d players, %.0fm x %.0fm pitch) to %s",
+            len(stats.pitch_log),
+            len(stats.pitch_log.unique_ids),
+            config.pitch.length_meters,
+            config.pitch.width_meters,
+            saved,
         )
 
     return 0

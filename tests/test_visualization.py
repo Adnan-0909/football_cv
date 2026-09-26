@@ -162,3 +162,56 @@ def test_team_legend_works_without_counts():
     frame = np.zeros((120, 320, 3), dtype=np.uint8)
     TacticalVisualizer().draw_team_legend(frame)
     assert frame.any(), "legend should be drawn even without counts"
+
+
+# ---------------------------------------------------------------------- #
+# Stage 4: top-down radar minimap
+# ---------------------------------------------------------------------- #
+
+def color_hits(img: np.ndarray, bgr: tuple[int, int, int], tol: int = 6) -> int:
+    """Pixels close to an exact BGR colour."""
+    b, g, r = img[:, :, 0].astype(int), img[:, :, 1].astype(int), img[:, :, 2].astype(int)
+    return int(
+        ((abs(b - bgr[0]) < tol) & (abs(g - bgr[1]) < tol) & (abs(r - bgr[2]) < tol)).sum()
+    )
+
+
+def test_radar_minimap_draws_pitch_panel_and_player_dots():
+    from app.pitch import PitchCoordinate
+    from app.visualization import COLOR_BALL, COLOR_TEAM_A, COLOR_TEAM_B
+
+    frame = np.full((240, 320, 3), (40, 90, 40), dtype=np.uint8)
+    visualizer = TacticalVisualizer(pitch_radar_size=(300, 200), pitch_size=(105.0, 68.0))
+    players = [
+        (PitchCoordinate(10.0, 50.0), COLOR_TEAM_A, 7),
+        (PitchCoordinate(90.0, 20.0), COLOR_TEAM_B, 9),
+    ]
+
+    out = visualizer.draw_radar_minimap(frame, players, PitchCoordinate(52.5, 34.0))
+
+    assert out is frame, "the radar is an extra panel on the same frame"
+    panel = out[32:232, 8:308]  # 300x200 radar, bottom-left, 8 px margin
+    # Diagram grass (45, 120, 45) is distinct from the video green (40, 90, 40).
+    assert color_hits(panel, (45, 120, 45), tol=10) > 5000, "pitch panel missing"
+    assert color_hits(panel, COLOR_TEAM_A, tol=6) > 0, "Team A dot missing"
+    assert color_hits(panel, COLOR_TEAM_B, tol=6) > 0, "Team B dot missing"
+    assert color_hits(panel, COLOR_BALL, tol=6) > 0, "ball dot missing"
+
+
+def test_radar_minimap_fits_small_frames():
+    from app.pitch import PitchCoordinate
+
+    frame = np.full((100, 200, 3), (40, 90, 40), dtype=np.uint8)
+    visualizer = TacticalVisualizer(pitch_radar_size=(300, 200))
+    out = visualizer.draw_radar_minimap(
+        frame, [(PitchCoordinate(50.0, 30.0), (255, 60, 0), 1)]
+    )
+    # The panel is scaled down instead of falling off the tiny frame.
+    assert color_hits(out, (45, 120, 45), tol=10) > 200
+
+
+def test_radar_minimap_works_without_players():
+    frame = np.full((240, 320, 3), (40, 90, 40), dtype=np.uint8)
+    out = TacticalVisualizer().draw_radar_minimap(frame, [])
+    assert out is frame
+    assert color_hits(out[32:232, 8:308], (45, 120, 45), tol=10) > 5000

@@ -7,14 +7,19 @@ Connects the individual stages into a runnable end-to-end flow:
     raw MP4 -> VideoReader -> FootballDetector -> PlayerTracker
             -> (optional stages) -> TacticalVisualizer -> VideoWriter
 
-Stages that are still scaffolds (pitch homography, formations, passing lanes)
-are probed once at startup; if they raise ``NotImplementedError``
-they are skipped with a single log line instead of crashing the run, so the
-pipeline starts working automatically as they get implemented.
+Stages that are still scaffolds (formations, passing lanes) are probed once at
+startup; if they raise ``NotImplementedError`` they are skipped with a single
+log line instead of crashing the run, so the pipeline starts working
+automatically as they get implemented.
 
 Stage 3 (team classification) lives in :mod:`app.team_classifier`: every
 tracked player gets TEAM_A / TEAM_B / UNKNOWN, drawn in a per-team colour with
 a legend, and exported per frame through :mod:`app.team_log`.
+
+Stage 4 (pitch mapping) lives in :mod:`app.pitch`: once a manual calibration
+file exists (``python main.py --calibrate``), every player's foot position is
+projected onto a top-down pitch in meters, drawn as a radar minimap, and
+exported per frame through :mod:`app.pitch_log`.
 """
 
 from __future__ import annotations
@@ -30,6 +35,8 @@ import numpy as np
 
 from app.config import AppConfig
 from app.detector import FootballDetector, Detection
+from app.pitch import PitchCoordinate, PitchTransformer, foot_position
+from app.pitch_log import PitchLog
 from app.team_classifier import TEAM_A, TEAM_B, TeamClassifier, team_label
 from app.team_log import TeamLog
 from app.tracker import PlayerTracker, TrackedObject
@@ -65,6 +72,10 @@ class PipelineStats:
     # {frame, timestamp, player_id, team, center} - exportable with
     # TeamLog.save_csv() (see also the --team-csv flag in main.py).
     team_log: TeamLog = field(default_factory=TeamLog)
+    # One record per tracked player per frame with its Stage 4 top-down pitch
+    # position in meters - exportable with PitchLog.save_csv()
+    # (see also the --pitch-csv flag in main.py).
+    pitch_log: PitchLog = field(default_factory=PitchLog)
 
     @property
     def processing_fps(self) -> float:
@@ -114,7 +125,9 @@ class TacticalPipeline:
         self.config = config
         self.detector = detector if detector is not None else FootballDetector(config.model)
         self.tracker = tracker if tracker is not None else PlayerTracker(config.tracker)
-        self.visualizer = visualizer if visualizer is not None else TacticalVisualizer()
+        self.visualizer = visualizer if visualizer is not None else TacticalVisualizer(
+            pitch_size=(config.pitch.length_meters, config.pitch.width_meters)
+        )
         self.logger = logging.getLogger("football_tracker.pipeline")
 
         # Filled by _update_teams(): team_id (TEAM_A/TEAM_B/None) per track_id,
@@ -122,6 +135,14 @@ class TacticalPipeline:
         self.team_by_track: Dict[int, Optional[int]] = {}
         self._team_stage_enabled = False
         self._team_classifier = None
+
+        # Stage 4: manual-calibration homography (enabled only when a
+        # calibration file exists - see _probe_optional_stages). Pitch
+        # positions are recomputed every frame, hence the plain dict.
+        self.pitch_transformer = PitchTransformer(config.pitch)
+        self.pitch_by_track: Dict[int, PitchCoordinate] = {}
+        self.ball_pitch: Optional[PitchCoordinate] = None
+        self._pitch_stage_enabled = False
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -182,6 +203,9 @@ class TacticalPipeline:
                     # Stage 3: cluster jersey colours and assign teams first,
                     # so the annotation and the team log use the same labels.
                     self._update_teams(frame, tracks, frame_index)
+                    # Stage 4: project every player's foot onto the top-down
+                    # pitch (per-frame positions - players move).
+                    self._update_pitch(tracks)
                     for track in tracks:
                         if track.class_name == "player":
                             stats.track_log.add_track(frame_index, timestamp, track)
@@ -191,6 +215,15 @@ class TacticalPipeline:
                                 track,
                                 self.team_by_track.get(track.track_id),
                             )
+                            coordinate = self.pitch_by_track.get(track.track_id)
+                            if coordinate is not None:
+                                stats.pitch_log.add_pitch(
+                                    frame_index,
+                                    timestamp,
+                                    track,
+                                    self.team_by_track.get(track.track_id),
+                                    coordinate,
+                                )
 
                     writer.write(self._annotate(frame, detections, tracks, frame_index))
 
@@ -217,6 +250,13 @@ class TacticalPipeline:
             self.logger.info(
                 "Team assignments: TEAM_A=%d TEAM_B=%d UNKNOWN=%d (unique players)",
                 counts["TEAM_A"], counts["TEAM_B"], counts["UNKNOWN"],
+            )
+        if len(stats.pitch_log):
+            self.logger.info(
+                "Pitch positions: %d records for %d players over %d frames",
+                len(stats.pitch_log),
+                len(stats.pitch_log.unique_ids),
+                len(stats.pitch_log.frames),
             )
         self.logger.info("Pipeline finished: %s", stats.summary())
         return stats
@@ -245,6 +285,75 @@ class TacticalPipeline:
                 "Team classification not implemented yet (app/team_classifier.py) - "
                 "players will be drawn in a neutral colour."
             )
+        self._probe_pitch_stage()
+
+    def _probe_pitch_stage(self) -> None:
+        """
+        Enable Stage 4 when a manual calibration file is present.
+
+        No file -> the stage stays off with one log line (the rest of the
+        pipeline is unaffected); a broken file -> the stage is skipped with a
+        warning instead of aborting the run.
+        """
+        path = Path(self.config.pitch.calibration_path)
+        if not path.exists():
+            self._pitch_stage_enabled = False
+            self.logger.info(
+                "Pitch mapping not calibrated (no %s) - no radar/pitch output. "
+                "Run 'python main.py --calibrate' to create it.",
+                path,
+            )
+            return
+        try:
+            self.pitch_transformer.load_calibration(path)
+        except Exception as exc:
+            self._pitch_stage_enabled = False
+            self.logger.warning(
+                "Pitch calibration %s could not be loaded (%s) - stage disabled.",
+                path,
+                exc,
+            )
+            return
+        self._pitch_stage_enabled = True
+        self.logger.info(
+            "Pitch mapping enabled: %d calibration points, mean error %.2f m "
+            "(pitch %.0f x %.0f m)",
+            self.pitch_transformer.point_count,
+            self.pitch_transformer.mean_error_meters or 0.0,
+            self.config.pitch.length_meters,
+            self.config.pitch.width_meters,
+        )
+
+    def _update_pitch(self, tracks: List[TrackedObject]) -> None:
+        """
+        Project this frame's players onto the top-down pitch (Stage 4).
+
+        Positions are recomputed every frame from each player's *foot*
+        (bottom-centre of the bbox) - see :func:`app.pitch.foot_position`.
+        ``self.pitch_by_track`` therefore always holds the current frame only.
+        """
+        if not self._pitch_stage_enabled:
+            return
+
+        self.pitch_by_track.clear()
+        self.ball_pitch = None
+        for track in tracks:
+            if track.class_name not in ("player", "ball"):
+                continue
+            try:
+                foot_x, foot_y = foot_position(track.bbox)
+                coordinate = self.pitch_transformer.transform_point(foot_x, foot_y)
+            except ValueError:
+                continue  # degenerate bbox (NaN/inf) - skip this object only
+            except RuntimeError:
+                self._pitch_stage_enabled = False
+                self.pitch_by_track.clear()
+                self.logger.warning("Pitch projection failed - disabling the stage.")
+                return
+            if track.class_name == "ball":
+                self.ball_pitch = coordinate
+            else:
+                self.pitch_by_track[track.track_id] = coordinate
 
     def _update_teams(
         self,
@@ -322,6 +431,21 @@ class TacticalPipeline:
         # Stage 3: show which colour means which team, with live counts.
         if self._team_stage_enabled and players:
             self.visualizer.draw_team_legend(frame, self._team_counts(tracks))
+
+        # Stage 4: top-down radar inset (extra panel - the original
+        # video annotations above are left untouched).
+        if (
+            self._pitch_stage_enabled
+            and self.config.pitch.show_radar
+            and players
+            and self.pitch_by_track
+        ):
+            radar_players = [
+                (self.pitch_by_track[track.track_id], self._color_for(track), track.track_id)
+                for track in tracks
+                if track.class_name == "player" and track.track_id in self.pitch_by_track
+            ]
+            self.visualizer.draw_radar_minimap(frame, radar_players, self.ball_pitch)
 
         self._draw_hud(frame, frame_index, len(detections), players, len(tracks))
         return frame

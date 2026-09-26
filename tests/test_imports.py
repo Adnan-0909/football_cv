@@ -40,9 +40,24 @@ def test_team_classifier_module():
 
 
 def test_pitch_module():
-    from app.pitch import PitchTransformer, PitchCoordinate
+    from app.pitch import PitchTransformer, PitchCoordinate, foot_position, draw_pitch
     pitch = PitchTransformer()
     assert pitch is not None
+    assert callable(foot_position)
+    assert callable(draw_pitch)
+
+
+def test_pitch_log_module():
+    from app.pitch_log import PitchLog, PitchRecord
+    assert PitchLog() is not None
+
+
+def test_calibration_module():
+    from app.calibration import CalibrationSession, run_calibration, pick_frame
+    assert callable(run_calibration)
+    assert callable(pick_frame)
+    from app.config import PitchConfig
+    assert CalibrationSession(PitchConfig()) is not None
 
 
 def test_formation_module():

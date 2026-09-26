@@ -79,3 +79,45 @@ def test_team_classifier_config_from_yaml(tmp_path: Path):
     assert tc.n_teams == 2
     assert tc.min_cluster_tracks == 4
     assert tc.feature_history == 32
+
+
+def test_pitch_config_defaults():
+    """Stage 4 defaults: standard pitch, manual calibration file, radar on."""
+    from app.config import PitchConfig
+
+    pitch = PitchConfig()
+    assert pitch.length_meters == 105.0
+    assert pitch.width_meters == 68.0
+    assert pitch.min_points >= 4
+    assert pitch.show_radar is True
+    assert Path(pitch.calibration_path).name == "pitch.json"
+
+
+def test_pitch_config_from_default_yaml():
+    """config.yaml pins the pitch size and calibration path."""
+    config = load_config()
+    assert config.pitch.length_meters == 105.0
+    assert config.pitch.width_meters == 68.0
+    assert config.pitch.calibration_path.is_absolute()
+    assert config.pitch.calibration_path.name == "pitch.json"
+
+
+def test_pitch_config_from_yaml(tmp_path: Path):
+    """YAML overrides win; the calibration path resolves against the root."""
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text(
+        "pitch:\n"
+        "  length_meters: 90.0\n"
+        "  width_meters: 45.0\n"
+        "  calibration_path: 'my_calib.json'\n"
+        "  min_points: 6\n"
+        "  show_radar: false\n",
+        encoding="utf-8",
+    )
+    pitch = load_config(cfg_file).pitch
+    assert pitch.length_meters == 90.0
+    assert pitch.width_meters == 45.0
+    assert pitch.min_points == 6
+    assert pitch.show_radar is False
+    assert pitch.calibration_path.is_absolute()
+    assert pitch.calibration_path.name == "my_calib.json"

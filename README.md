@@ -8,7 +8,8 @@ A computer-vision pipeline for detecting, tracking, and annotating players in fo
 - Persistent player tracking IDs
 - Two-team classification from jersey colors (TEAM_A / TEAM_B / UNKNOWN)
 - Annotated video output with per-team colors and a team legend
-- Tracking and team CSV export
+- Top-down pitch mapping via manual calibration (radar minimap + pitch CSV)
+- Tracking, team, and pitch CSV export
 - Configurable processing options
 - Dependency-free lightweight tracker fallback
 
@@ -63,6 +64,36 @@ Teams are discovered from the footage itself (no fixed colors): each player is
 labeled `TEAM_A`, `TEAM_B`, or `UNKNOWN` while uncertain (referee, goalkeeper,
 heavy occlusion, background-dominated box).
 
+### Pitch calibration (once per video)
+
+```powershell
+python main.py --input input\match.mp4 --calibrate
+```
+
+Phase 1 shows a frame (middle of the clip; `--calibration-frame N` to change);
+left-click 4-8 points **on the ground** — penalty-box corners, centre spot,
+halfway-line/sideline intersections. Never players, sky, or stands. Press
+Enter. Phase 2 shows a drawn pitch diagram: click the same points in the same
+order, Enter to build the homography and save `calibration/pitch.json` (a mean
+reprojection error well under a metre means a good fit). Keys: `u` undo,
+`r` restart, `Esc` cancel. Without a calibration file the pitch stage simply
+stays off.
+
+After calibrating, normal runs add a top-down radar in the bottom-left corner
+(the original video annotations are unchanged) and can export positions:
+
+```powershell
+python main.py --input input\match.mp4 --pitch-csv output\pitch.csv
+```
+
+`pitch.csv` columns: `frame,timestamp,player_id,team,pitch_x,pitch_y`
+
+Coordinates are metres on a configurable pitch (default 105 x 68 m): origin
+`(0,0)` at one pitch corner, `x` along the length (0 = left goal line,
+105 = right goal line), `y` along the width (0 = near sideline, 68 = far one).
+Players are projected from their foot position (bottom-center of the box), so
+points off the pitch plane come out outside `0..length` / `0..width`.
+
 View available options:
 
 ```powershell
@@ -77,14 +108,14 @@ python -m pytest
 
 ## Configuration
 
-Edit `config.yaml` to configure model weights, confidence thresholds, video paths, tracker settings, team classification (`team_classifier` section: torso crop, dominant-color extraction, clustering, uncertainty gates, temporal smoothing), device selection, and logging.
+Edit `config.yaml` to configure model weights, confidence thresholds, video paths, tracker settings, team classification (`team_classifier` section: torso crop, dominant-color extraction, clustering, uncertainty gates, temporal smoothing), pitch mapping (`pitch` section: dimensions, calibration path, radar toggle), device selection, and logging.
 
 YOLO weights are downloaded automatically when missing.
 
 ## Roadmap
 
 - [x] Team classification
-- [ ] Pitch homography and radar projection
+- [x] Pitch homography and radar projection (manual calibration)
 - [ ] Formation analysis
 - [ ] Passing-lane detection
 - [ ] Tactical metrics export

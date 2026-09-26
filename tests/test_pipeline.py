@@ -429,3 +429,137 @@ def test_pipeline_draws_per_team_colours_and_legend(tmp_path: Path):
     legend = frame[:100, frame.shape[1] - 140:]
     assert count_color_pixels(legend, COLOR_TEAM_A) > 50
     assert count_color_pixels(legend, COLOR_TEAM_B) > 50
+
+
+# ---------------------------------------------------------------------- #
+# Stage 4: pitch mapping end-to-end
+# ---------------------------------------------------------------------- #
+
+def make_pitch_calibration(path: Path, frame_size=FRAME_SIZE) -> Path:
+    """Frame corners mapped onto the corners of a 105x68 pitch (meters)."""
+    from app.config import PitchConfig
+    from app.pitch import PitchTransformer
+
+    width, height = frame_size
+    transformer = PitchTransformer(PitchConfig(calibration_path=path))
+    transformer.estimate_homography(
+        [(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)],
+        [(0.0, 0.0), (105.0, 0.0), (105.0, 68.0), (0.0, 68.0)],
+    )
+    transformer.save_calibration(path, frame_index=0, image_size=frame_size)
+    return path
+
+
+def make_pitch_config(
+    input_path: Path, output_path: Path, calibration_path: Path
+) -> AppConfig:
+    from app.config import PitchConfig
+
+    return AppConfig(
+        video=VideoConfig(input_path=input_path, output_path=output_path),
+        pitch=PitchConfig(calibration_path=calibration_path),
+    )
+
+
+def test_pitch_stage_disabled_without_calibration(tmp_path: Path):
+    """No calibration file -> the stage stays off and no pitch rows appear."""
+    input_path = write_test_video(tmp_path / "input.mp4", frames=5)
+    config = make_pitch_config(
+        input_path, tmp_path / "out.mp4", tmp_path / "missing.json"
+    )
+
+    stats = TacticalPipeline(config, detector=StubDetector()).run()
+
+    assert len(stats.pitch_log) == 0
+    assert not stats.pitch_log.records
+
+
+def test_pipeline_projects_foot_positions_in_meters(tmp_path: Path):
+    """Every player frame gets a pitch coordinate in meters (foot position)."""
+    input_path = write_test_video(tmp_path / "input.mp4")
+    calibration = make_pitch_calibration(tmp_path / "calib.json")
+    config = make_pitch_config(input_path, tmp_path / "out.mp4", calibration)
+
+    stats = TacticalPipeline(config, detector=StubDetector()).run()
+
+    assert len(stats.pitch_log) == FRAME_COUNT  # one player in every frame
+    record = stats.pitch_log.records[0]
+
+    # The homography is a pure scale between the two rectangles:
+    # foot = centre/bottom of bbox (10, 80, 50, 180) -> (30, 180) px.
+    assert record.pitch_x == pytest.approx(30.0 * 105.0 / FRAME_SIZE[0])
+    assert record.pitch_y == pytest.approx(180.0 * 68.0 / FRAME_SIZE[1])
+    assert 0.0 <= record.pitch_x <= 105.0
+    assert 0.0 <= record.pitch_y <= 68.0
+    assert record.team == "UNKNOWN"  # single player: no cluster fit yet
+    assert stats.pitch_log.unique_ids == {1}
+
+
+def test_pipeline_exports_pitch_csv(tmp_path: Path):
+    input_path = write_test_video(tmp_path / "input.mp4", frames=10)
+    calibration = make_pitch_calibration(tmp_path / "calib.json")
+    config = make_pitch_config(input_path, tmp_path / "out.mp4", calibration)
+
+    stats = TacticalPipeline(config, detector=StubDetector()).run()
+    csv_path = stats.pitch_log.save_csv(tmp_path / "nested" / "pitch.csv")
+
+    with open(csv_path, newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+
+    assert rows[0] == [
+        "frame", "timestamp", "player_id", "team", "pitch_x", "pitch_y",
+    ]
+    assert len(rows) == 1 + 10
+    assert rows[1][0] == "0" and rows[1][2] == "1"
+    assert float(rows[1][4]) == pytest.approx(30.0 * 105.0 / FRAME_SIZE[0])
+    assert float(rows[1][5]) == pytest.approx(180.0 * 68.0 / FRAME_SIZE[1])
+
+
+def test_radar_inset_drawn_only_when_calibrated(tmp_path: Path):
+    """Calibrated -> radar panel with team-coloured dots; otherwise untouched."""
+    from app.tracker import TrackedObject
+    from app.visualization import COLOR_TEAM_A
+
+    tracks = [
+        TrackedObject(
+            track_id=1, bbox=(10.0, 80.0, 50.0, 180.0), class_id=0, class_name="player"
+        )
+    ]
+    blank = (40, 90, 40)
+    radar_grass = (45, 120, 45)
+
+    # Without calibration: bottom-left stays plain video green.
+    uncalibrated = TacticalPipeline(
+        make_pitch_config(
+            write_test_video(tmp_path / "in.mp4", frames=1),
+            tmp_path / "out.mp4",
+            tmp_path / "missing.json",
+        ),
+        detector=StubDetector(),
+    )
+    uncalibrated._probe_optional_stages()
+    assert not uncalibrated._pitch_stage_enabled
+    frame = np.full((FRAME_SIZE[1], FRAME_SIZE[0], 3), blank, dtype=np.uint8)
+    plain = uncalibrated._annotate(frame.copy(), [], tracks, 0)
+    assert count_color_pixels(plain[32:232, 8:308], radar_grass, tol=10) == 0
+
+    # With calibration: the 300x200 radar panel appears bottom-left with the
+    # player dot in its team colour.
+    calibrated = TacticalPipeline(
+        make_pitch_config(
+            write_test_video(tmp_path / "in2.mp4", frames=1),
+            tmp_path / "out2.mp4",
+            make_pitch_calibration(tmp_path / "calib.json"),
+        ),
+        detector=StubDetector(),
+    )
+    calibrated._probe_optional_stages()
+    assert calibrated._pitch_stage_enabled
+    calibrated.team_by_track[1] = 0  # pretend Stage 3 committed this player
+    calibrated._update_pitch(tracks)
+    assert 1 in calibrated.pitch_by_track
+
+    annotated = calibrated._annotate(frame.copy(), [], tracks, 0)
+    panel = annotated[32:232, 8:308]
+    assert count_color_pixels(panel, radar_grass, tol=10) > 5000, "radar missing"
+    assert count_color_pixels(panel, COLOR_TEAM_A, tol=6) > 0, "player dot missing"

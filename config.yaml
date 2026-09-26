@@ -119,10 +119,20 @@ team_classifier:
   # Seed for the clustering (deterministic output for a given clip)
   random_seed: 0
 
-# 2D Pitch mapping configuration (Standard FIFA pitch dimensions in meters)
+# 2D Pitch mapping configuration (Stage 4, standard FIFA pitch dimensions)
+# Coordinate system (meters): origin (0,0) at the bottom-left pitch corner,
+# x along the length 0 -> 105, y along the width 0 -> 68. See app/pitch.py.
 pitch:
   length_meters: 105.0
   width_meters: 68.0
+  # Manual calibration file (image <-> pitch correspondences for the video
+  # you are processing). The pitch stage only runs when this file exists -
+  # create it with: python main.py --calibrate
+  calibration_path: "calibration/pitch.json"
+  # Minimum number of image/pitch point pairs accepted by findHomography().
+  min_points: 4
+  # Draw the top-down radar inset on the annotated video (needs calibration).
+  show_radar: true
 
 # Logging configuration
 logging:

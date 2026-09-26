@@ -12,11 +12,11 @@ Provides overlay drawing tools for broadcasting tactical insights on video frame
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from app.pitch import PitchCoordinate
+from app.pitch import PitchCoordinate, draw_pitch
 from app.tracker import TrackedObject
 
 logger = logging.getLogger(__name__)
@@ -46,15 +46,28 @@ class TacticalVisualizer:
     Renders visual tactical annotations on video frames.
     """
 
-    def __init__(self, pitch_radar_size: Tuple[int, int] = (300, 200)) -> None:
+    def __init__(
+        self,
+        pitch_radar_size: Tuple[int, int] = (300, 200),
+        pitch_size: Tuple[float, float] = (105.0, 68.0),
+    ) -> None:
         """
         Initialize the visualizer.
 
         Args:
             pitch_radar_size: (width, height) of the mini-map 2D pitch radar.
+            pitch_size: (length, width) of the real pitch in meters - used to
+                map pitch coordinates onto the radar drawing.
         """
         self.radar_width, self.radar_height = pitch_radar_size
-        logger.info("Initialized TacticalVisualizer (radar_size=%dx%d)", self.radar_width, self.radar_height)
+        self.pitch_length, self.pitch_width = pitch_size
+        logger.info(
+            "Initialized TacticalVisualizer (radar_size=%dx%d, pitch=%.0fm x %.0fm)",
+            self.radar_width,
+            self.radar_height,
+            self.pitch_length,
+            self.pitch_width,
+        )
 
     def draw_player_marker(
         self,
@@ -251,21 +264,65 @@ class TacticalVisualizer:
     def draw_radar_minimap(
         self,
         frame: np.ndarray,
-        team_a_coords: List[PitchCoordinate],
-        team_b_coords: List[PitchCoordinate],
+        players: Sequence[Tuple[PitchCoordinate, Tuple[int, int, int], Optional[int]]],
         ball_coord: Optional[PitchCoordinate] = None,
     ) -> np.ndarray:
         """
-        Draw a 2D top-down mini pitch radar in the corner of the frame.
+        Draw the top-down pitch radar (Stage 4) in the bottom-left corner.
+
+        The *original* video annotations stay untouched - the radar is added
+        as an extra panel, so both views are preserved in one output.
 
         Args:
             frame: Video frame image.
-            team_a_coords: Pitch coordinates for Team A.
-            team_b_coords: Pitch coordinates for Team B.
-            ball_coord: Pitch coordinates for the ball.
+            players: Sequence of ``(pitch_coordinate, bgr_color, track_id)``
+                for every player visible this frame (``track_id`` may be None
+                to skip the label).
+            ball_coord: Optional ball position in pitch meters.
 
         Returns:
-            np.ndarray: Frame with embedded mini-map radar.
+            np.ndarray: Frame with the embedded top-down radar.
         """
-        # Radar drawing will be fully implemented when homography is connected.
+        radar = draw_pitch(self.pitch_length, self.pitch_width,
+                           (self.radar_width, self.radar_height))
+        scale_x = self.radar_width / float(self.pitch_length)
+        scale_y = self.radar_height / float(self.pitch_width)
+        dot_r = max(3, self.radar_height // 55)
+
+        def to_px(coord: PitchCoordinate) -> Tuple[int, int]:
+            # Clamped so wildly-bad projections still render inside the panel.
+            x = min(max(coord.x, 0.0), self.pitch_length)
+            y = min(max(coord.y, 0.0), self.pitch_width)
+            return int(round(x * scale_x)), int(round(y * scale_y))
+
+        for coord, color, track_id in players:
+            px, py = to_px(coord)
+            cv2.circle(radar, (px, py), dot_r, color, -1, cv2.LINE_AA)
+            cv2.circle(radar, (px, py), dot_r, (0, 0, 0), 1, cv2.LINE_AA)
+            if track_id is not None:
+                cv2.putText(
+                    radar, str(track_id), (px + dot_r + 1, py - dot_r // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (255, 255, 255), 1, cv2.LINE_AA,
+                )
+
+        if ball_coord is not None:
+            bx, by = to_px(ball_coord)
+            cv2.circle(radar, (bx, by), max(2, dot_r - 1), COLOR_BALL, -1, cv2.LINE_AA)
+            cv2.circle(radar, (bx, by), max(2, dot_r - 1), (0, 0, 0), 1, cv2.LINE_AA)
+
+        # Keep the panel readable on any frame size (small test clips too).
+        margin = 8
+        avail_w, avail_h = frame.shape[1] - 2 * margin, frame.shape[0] - 2 * margin
+        if radar.shape[1] > avail_w or radar.shape[0] > avail_h:
+            fit = min(avail_w / radar.shape[1], avail_h / radar.shape[0])
+            radar = cv2.resize(
+                radar,
+                (max(1, int(radar.shape[1] * fit)), max(1, int(radar.shape[0] * fit))),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        h, w = radar.shape[:2]
+        x0, y0 = margin, frame.shape[0] - h - margin
+        frame[y0:y0 + h, x0:x0 + w] = radar
+        cv2.rectangle(frame, (x0, y0), (x0 + w - 1, y0 + h - 1), (230, 230, 230), 1)
         return frame
