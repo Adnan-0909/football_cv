@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 import pytest
 
-from app.config import AppConfig, VideoConfig
+from app.config import AppConfig, PitchConfig, VideoConfig
 from app.detector import Detection
 from app.pipeline import TacticalPipeline
 from app.track_log import TrackLog
@@ -86,6 +86,10 @@ def write_test_video(path: Path, frames: int = FRAME_COUNT) -> Path:
 def make_config(input_path: Path, output_path: Path, **video_kwargs) -> AppConfig:
     return AppConfig(
         video=VideoConfig(input_path=input_path, output_path=output_path, **video_kwargs),
+        # Keep Stage 4 hermetic: never pick up a real calibration/pitch.json
+        # that happens to exist in the working directory (the radar inset
+        # would cover parts of the small synthetic test frame).
+        pitch=PitchConfig(calibration_path=output_path.parent / "no_calibration.json"),
     )
 
 

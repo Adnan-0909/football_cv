@@ -210,6 +210,42 @@ def test_radar_minimap_fits_small_frames():
     assert color_hits(out, (45, 120, 45), tol=10) > 200
 
 
+def test_radar_minimap_matches_camera_orientation():
+    """y=0 (near sideline) renders at the BOTTOM of the panel.
+
+    The camera sits on the near side, so in the video the near sideline is at
+    the bottom of the frame; the radar mirrors that view instead of drawing
+    +y downward like a plain plot (which would vertically flip formations
+    against the footage).
+    """
+    from app.pitch import PitchCoordinate
+    from app.visualization import COLOR_TEAM_A, COLOR_TEAM_B
+
+    frame = np.full((240, 320, 3), (40, 90, 40), dtype=np.uint8)
+    visualizer = TacticalVisualizer(pitch_radar_size=(300, 200), pitch_size=(105.0, 68.0))
+    visualizer.draw_radar_minimap(
+        frame,
+        [
+            (PitchCoordinate(52.5, 4.0), COLOR_TEAM_A, 1),   # near the camera
+            (PitchCoordinate(52.5, 64.0), COLOR_TEAM_B, 2),  # far side
+        ],
+    )
+    panel = frame[32:232, 8:308]
+
+    def mean_row(color, tol=6):
+        b, g, r = panel[:, :, 0].astype(int), panel[:, :, 1].astype(int), panel[:, :, 2].astype(int)
+        mask = (abs(b - color[0]) < tol) & (abs(g - color[1]) < tol) & (abs(r - color[2]) < tol)
+        rows = np.nonzero(mask)[0]
+        assert rows.size > 0, f"dot colour {color} missing from panel"
+        return rows.mean()
+
+    near_row, far_row = mean_row(COLOR_TEAM_A), mean_row(COLOR_TEAM_B)
+    # Panel is 200 px for 68 m: y=4 must sit far below y=64.
+    assert near_row > far_row + 50, (
+        f"near-side dot (row {near_row:.0f}) must render below far-side dot (row {far_row:.0f})"
+    )
+
+
 def test_radar_minimap_works_without_players():
     frame = np.full((240, 320, 3), (40, 90, 40), dtype=np.uint8)
     out = TacticalVisualizer().draw_radar_minimap(frame, [])

@@ -77,7 +77,9 @@ Enter. Phase 2 shows a drawn pitch diagram: click the same points in the same
 order, Enter to build the homography and save `calibration/pitch.json` (a mean
 reprojection error well under a metre means a good fit). Keys: `u` undo,
 `r` restart, `Esc` cancel. Without a calibration file the pitch stage simply
-stays off.
+stays off. The homography matches the camera pose at the chosen frame - if the
+broadcast pans or zooms far from it later, re-run with `--calibration-frame`
+set inside the segment you actually analyse.
 
 After calibrating, normal runs add a top-down radar in the bottom-left corner
 (the original video annotations are unchanged) and can export positions:

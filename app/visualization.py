@@ -273,6 +273,11 @@ class TacticalVisualizer:
         The *original* video annotations stay untouched - the radar is added
         as an extra panel, so both views are preserved in one output.
 
+        Orientation matches the camera view: x=0 (goal line) on the left and
+        y=0 (near sideline) at the *bottom* of the panel, just like the video
+        (the camera sits on the near side). The pitch axes themselves are
+        unchanged - only the rendering flips the vertical axis.
+
         Args:
             frame: Video frame image.
             players: Sequence of ``(pitch_coordinate, bgr_color, track_id)``
@@ -285,6 +290,10 @@ class TacticalVisualizer:
         """
         radar = draw_pitch(self.pitch_length, self.pitch_width,
                            (self.radar_width, self.radar_height))
+        # draw_pitch puts y=0 at the top; flip so y=0 (near sideline) sits at
+        # the bottom of the panel - matching what the camera sees. The
+        # standard markings are symmetric, so this only anchors the frame.
+        radar = cv2.flip(radar, 0)
         scale_x = self.radar_width / float(self.pitch_length)
         scale_y = self.radar_height / float(self.pitch_width)
         dot_r = max(3, self.radar_height // 55)
@@ -293,7 +302,9 @@ class TacticalVisualizer:
             # Clamped so wildly-bad projections still render inside the panel.
             x = min(max(coord.x, 0.0), self.pitch_length)
             y = min(max(coord.y, 0.0), self.pitch_width)
-            return int(round(x * scale_x)), int(round(y * scale_y))
+            # y grows toward the FAR side; the panel mirrors the camera, so
+            # near (y=0) maps to the bottom row.
+            return int(round(x * scale_x)), int(round((self.pitch_width - y) * scale_y))
 
         for coord, color, track_id in players:
             px, py = to_px(coord)
