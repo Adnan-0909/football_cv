@@ -303,6 +303,30 @@ def test_referee_and_goalkeeper_stay_unknown():
     assert all(final[i] is None for i in outliers), f"referee/keeper labelled: {final}"
 
 
+def test_a_lone_referee_cannot_steal_the_split():
+    """
+    A lone high-chroma outlier must not become a "team" of its own.
+
+    On wide broadcast shots the kits sit near the feature origin (washed-out
+    white / dark kits, background-blurred crops) while the referee's orange is
+    far away in chroma, so k-means minimizes inertia by splitting
+    ``{referee} vs {both kits}`` - merging the two real teams into one cluster
+    and labelling the whole pitch TEAM_A. The minority-share guard must refuse
+    that degenerate fit instead.
+    """
+    white = (245, 245, 245)   # near-grey kit: almost no chroma
+    orange = (0, 140, 255)    # referee: full-saturation chroma, far from white
+    crops = [np.full((80, 60, 3), white, dtype=np.uint8)] * 10
+    crops.append(np.full((80, 60, 3), orange, dtype=np.uint8))
+
+    classifier = TeamClassifier()
+    classifier.fit(crops)
+
+    # {referee} vs {everyone else} is not two teams -> no model at all, so
+    # nobody can be mislabelled by it.
+    assert not classifier.model_ready
+
+
 def test_identical_kits_stay_unknown():
     """One blob instead of two teams -> no model, nobody gets a forced label."""
     only_color = KIT_PAIRS["blue_red"][0]

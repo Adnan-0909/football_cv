@@ -102,6 +102,12 @@ class TeamClassifierConfig:
     # Per-cluster radius is floored at this fraction of the separation so an
     # extremely tight cluster cannot reject everything as "too far".
     radius_floor_ratio: float = 0.05
+    # Smallest share of pooled observations any team cluster may hold. A split
+    # whose minority is smaller than this is degenerate (e.g. a lone referee
+    # forms one cluster while both real kits merge into the other, which is
+    # what happens on wide shots with tiny, background-contaminated crops),
+    # so the whole fit is refused instead of labelling everyone wrongly.
+    min_minority_share: float = 0.15
 
     # --- assignment + temporal smoothing ---------------------------------- #
     # Rolling observation window per player (frames kept for the mean colour).
@@ -277,6 +283,7 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> AppConfig:
         kmeans_restarts=int(tc_raw.get("kmeans_restarts", 3)),
         min_separation_ratio=float(tc_raw.get("min_separation_ratio", 3.0)),
         radius_floor_ratio=float(tc_raw.get("radius_floor_ratio", 0.05)),
+        min_minority_share=float(tc_raw.get("min_minority_share", 0.15)),
         feature_history=int(tc_raw.get("feature_history", 32)),
         mean_window=int(tc_raw.get("mean_window", 10)),
         unknown_radius_scale=float(tc_raw.get("unknown_radius_scale", 2.5)),

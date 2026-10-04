@@ -477,6 +477,18 @@ class TeamClassifier:
         if centers.shape[0] < 2:
             return None
 
+        # Degenerate split guard: a lone referee/keeper (or any odd colour far
+        # from both kits) can win one k-means cluster while both real kits
+        # merge into the other - especially on wide shots whose tiny crops are
+        # blurred by background pixels. Two real teams always hold a
+        # comparable share of the observations, so a minority below
+        # min_minority_share means the split found outliers, not teams: refuse
+        # the fit and let the previous model (or UNKNOWN) stand.
+        counts = np.bincount(labels, minlength=centers.shape[0])
+        minority_share = float(counts.min()) / max(int(counts.sum()), 1)
+        if minority_share < self.config.min_minority_share:
+            return None
+
         radii = np.empty(centers.shape[0], dtype=np.float64)
         for j in range(centers.shape[0]):
             members = samples[labels == j]
