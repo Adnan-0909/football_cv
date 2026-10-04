@@ -135,6 +135,16 @@ def parse_arguments() -> argparse.Namespace:
         metavar="N",
         help="Frame index used by --calibrate (default: middle of the video).",
     )
+    parser.add_argument(
+        "--stage5",
+        action="store_true",
+        help=(
+            "Write a Stage 5 side-by-side output: original annotated footage "
+            "on the left, top-down tactical pitch on the right (Stage 6 "
+            "formation + Stage 7 teammate graph are drawn on the pitch). "
+            "Requires a Stage 4 calibration for player positions."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -408,8 +418,11 @@ def main() -> int:
     if pitch_csv_path is not None:
         logger.info("Pitch positions will also be written to %s", pitch_csv_path)
 
+    if args.stage5:
+        logger.info("Stage 5 side-by-side output enabled (video | tactical pitch).")
+
     try:
-        stats = TacticalPipeline(config).run(
+        stats = TacticalPipeline(config, stage5=args.stage5).run(
             input_path=config.video.input_path,
             output_path=config.video.output_path,
         )

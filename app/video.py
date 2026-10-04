@@ -193,6 +193,10 @@ class VideoWriter:
 
         logger.info("Opened video writer: %s (%dx%d @ %.2f fps)", self.output_path.name, self.width, self.height, self.fps)
 
+    def isOpened(self) -> bool:
+        """Whether the underlying OpenCV writer opened successfully."""
+        return self._writer is not None and self._writer.isOpened()
+
     def write(self, frame: np.ndarray) -> None:
         """Write a single frame."""
         if self._writer is None or not self._writer.isOpened():

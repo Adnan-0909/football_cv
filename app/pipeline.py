@@ -35,9 +35,18 @@ import numpy as np
 
 from app.config import AppConfig
 from app.detector import FootballDetector, Detection
+from app.formation_analyzer import FormationAnalyzer
 from app.pitch import PitchCoordinate, PitchTransformer, foot_position
 from app.pitch_log import PitchLog
+from app.pitch_renderer import (
+    SEPARATOR_WIDTH,
+    PitchRenderer,
+    build_overlay_lines,
+    pitch_panel_width,
+    render_side_by_side,
+)
 from app.team_classifier import TEAM_A, TEAM_B, TeamClassifier, team_label
+from app.team_graph import TeamGraphBuilder, TeamGraphResult
 from app.team_log import TeamLog
 from app.tracker import PlayerTracker, TrackedObject
 from app.track_log import TrackLog
@@ -76,6 +85,12 @@ class PipelineStats:
     # position in meters - exportable with PitchLog.save_csv()
     # (see also the --pitch-csv flag in main.py).
     pitch_log: PitchLog = field(default_factory=PitchLog)
+    # Stage 6: last processed frame's formation read-out per team
+    # ({"TEAM_A": {...}, "TEAM_B": {...}}) - only filled in Stage 5 runs.
+    formations: Dict[str, dict] = field(default_factory=dict)
+    # Stage 7: last processed frame's teammate graph (edges + network
+    # metrics) - only filled in Stage 5 runs.
+    graph_result: Optional[TeamGraphResult] = None
 
     @property
     def processing_fps(self) -> float:
@@ -114,6 +129,7 @@ class TacticalPipeline:
         detector: Optional[FootballDetector] = None,
         tracker: Optional[PlayerTracker] = None,
         visualizer: Optional[TacticalVisualizer] = None,
+        stage5: bool = False,
     ) -> None:
         """
         Args:
@@ -121,6 +137,9 @@ class TacticalPipeline:
             detector: Optional detector override (defaults to ``FootballDetector``).
             tracker: Optional tracker override (defaults to ``PlayerTracker``).
             visualizer: Optional visualizer override.
+            stage5: Emit the Stage 5 side-by-side output (annotated footage on
+                the left, tactical pitch with Stage 6/7 overlays on the right).
+                Off by default, so the plain pipeline output is unchanged.
         """
         self.config = config
         self.detector = detector if detector is not None else FootballDetector(config.model)
@@ -129,6 +148,7 @@ class TacticalPipeline:
             pitch_size=(config.pitch.length_meters, config.pitch.width_meters)
         )
         self.logger = logging.getLogger("football_tracker.pipeline")
+        self.stage5 = bool(stage5)
 
         # Filled by _update_teams(): team_id (TEAM_A/TEAM_B/None) per track_id,
         # persisted across frames so assignments never flicker.
@@ -143,6 +163,16 @@ class TacticalPipeline:
         self.pitch_by_track: Dict[int, PitchCoordinate] = {}
         self.ball_pitch: Optional[PitchCoordinate] = None
         self._pitch_stage_enabled = False
+
+        # Stage 5/6/7: created in _setup_stage5() once the source height is
+        # known (the pitch panel is letterboxed to the video height).
+        self.pitch_renderer: Optional[PitchRenderer] = None
+        self.formation_analyzer: Optional[FormationAnalyzer] = None
+        self.graph_builder: Optional[TeamGraphBuilder] = None
+        # Side-by-side composite output (Stage 5 flag, off by default).
+        self._stage5_enabled = False
+        # Stage 6/7 analysis needs pitch positions, i.e. Stage 5 + calibration.
+        self._tactics_enabled = False
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -194,7 +224,28 @@ class TacticalPipeline:
             # Timestamps always refer to the source footage, so they stay
             # correct when frames are skipped with frame_stride.
             source_fps = reader.fps if reader.fps and reader.fps > 0 else 25.0
-            with VideoWriter(output_path, fps=source_fps / stride, width=reader.width, height=reader.height) as writer:
+
+            # Stage 5: build the pitch panel at the source height and open the
+            # writer with the *exact* composite width (the shared
+            # pitch_panel_width() helper is what render_side_by_side uses too).
+            self._setup_stage5(reader.height)
+            output_width = reader.width
+            if self._stage5_enabled and self.pitch_renderer is not None:
+                output_width = (
+                    reader.width
+                    + SEPARATOR_WIDTH
+                    + pitch_panel_width(reader.height, self.pitch_renderer)
+                )
+
+            with VideoWriter(
+                output_path,
+                fps=source_fps / stride,
+                width=output_width,
+                height=reader.height,
+            ) as writer:
+                if not writer.isOpened():  # open() already raises; belt and braces
+                    raise RuntimeError(f"Video writer did not open: {output_path}")
+
                 for frame_index, frame in reader.read_frames():
                     detections = self.detector.detect(frame)
                     tracks = self.tracker.update(self._tracker_inputs(detections), frame)
@@ -225,7 +276,33 @@ class TacticalPipeline:
                                     coordinate,
                                 )
 
-                    writer.write(self._annotate(frame, detections, tracks, frame_index))
+                    # Stage 5: stamp pitch coordinates onto the tracks (the
+                    # renderer reads track.pitch_coordinate).
+                    positions: List[tuple] = []
+                    if self._stage5_enabled:
+                        positions = self._tactics_positions(tracks)
+
+                    # Stage 6 (formation) + Stage 7 (teammate graph): one
+                    # analysis pass per frame; results are drawn on the pitch.
+                    formations: Optional[Dict[str, dict]] = None
+                    graph_result: Optional[TeamGraphResult] = None
+                    if self._tactics_enabled:
+                        formations = self.formation_analyzer.update(positions)  # type: ignore[union-attr]
+                        graph_result = self.graph_builder.update(positions)  # type: ignore[union-attr]
+                        stats.formations = formations
+                        stats.graph_result = graph_result
+
+                    annotated = self._annotate(frame, detections, tracks, frame_index)
+                    if self._stage5_enabled:
+                        annotated = render_side_by_side(
+                            annotated,
+                            self.pitch_renderer,  # type: ignore[arg-type]
+                            tracks,
+                            self.team_by_track,
+                            edges=graph_result.edges if graph_result is not None else (),
+                            overlay_lines=build_overlay_lines(formations, graph_result),
+                        )
+                    writer.write(annotated)
 
                     stats.frames_processed += 1
                     stats.detections_total += len(detections)
@@ -258,8 +335,130 @@ class TacticalPipeline:
                 len(stats.pitch_log.unique_ids),
                 len(stats.pitch_log.frames),
             )
+        for label in ("TEAM_A", "TEAM_B"):
+            info = stats.formations.get(label)
+            if info and info.get("players"):
+                self.logger.info(
+                    "Formation (last frame) %s: %s - confidence %.0f%%, "
+                    "width %.1f m, depth %.1f m, compactness %.3f",
+                    label,
+                    info["formation"],
+                    info["confidence"] * 100.0,
+                    info["width"],
+                    info["depth"],
+                    info["compactness"],
+                )
+        if stats.graph_result is not None:
+            for label in ("TEAM_A", "TEAM_B"):
+                metric = stats.graph_result.metrics.get(label, {})
+                if metric.get("players"):
+                    self.logger.info(
+                        "Teammate graph (last frame) %s: %d connections, "
+                        "density %.2f, avg distance %.1f m, max distance %.1f m",
+                        label,
+                        metric["connections"],
+                        metric["density"],
+                        metric["avg_teammate_distance"],
+                        metric["max_teammate_distance"],
+                    )
         self.logger.info("Pipeline finished: %s", stats.summary())
         return stats
+
+    # ------------------------------------------------------------------ #
+    # Stage 5 / 6 / 7 helpers
+    # ------------------------------------------------------------------ #
+
+    def _setup_stage5(self, video_height: int) -> None:
+        """
+        Create the Stage 5/6/7 objects once the source height is known.
+
+        The pitch panel is letterboxed to ``video_height``, and its width must
+        be fixed *before* the ``VideoWriter`` opens (writer size and frame size
+        have to match exactly - codecs round odd widths down). Rendering the
+        panel directly at the final size also avoids a rescaling pass, so the
+        pitch and its Stage 6/7 overlay stay crisp.
+
+        Stage 6/7 analysis additionally needs pitch positions, so it is only
+        enabled when Stage 5 was requested *and* a calibration exists.
+        """
+        self._stage5_enabled = self.stage5
+        self._tactics_enabled = False
+        if not self.stage5:
+            return
+
+        base = PitchRenderer(
+            pitch_length_meters=self.config.pitch.length_meters,
+            pitch_width_meters=self.config.pitch.width_meters,
+        )
+        panel_width = pitch_panel_width(video_height, base)
+        self.pitch_renderer = PitchRenderer(
+            pitch_length_meters=self.config.pitch.length_meters,
+            pitch_width_meters=self.config.pitch.width_meters,
+            rendered_size=(panel_width, video_height),
+        )
+        self.logger.info(
+            "Stage 5 side-by-side enabled: pitch panel %d px wide at %d px "
+            "height.",
+            panel_width,
+            video_height,
+        )
+
+        if not self._pitch_stage_enabled:
+            self.logger.warning(
+                "--stage5 requested but pitch mapping is not calibrated - the "
+                "pitch panel will be empty and Stage 6/7 analysis is skipped. "
+                "Run 'python main.py --calibrate' first."
+            )
+            return
+
+        tactics = self.config.tactics
+        self.formation_analyzer = FormationAnalyzer(
+            pitch_length=self.config.pitch.length_meters,
+            pitch_width=self.config.pitch.width_meters,
+            window_size=tactics.formation_window,
+            min_confidence=tactics.formation_min_confidence,
+        )
+        self.graph_builder = TeamGraphBuilder(
+            max_connection_distance=tactics.max_connection_distance,
+            k_neighbors=tactics.connection_k_neighbors,
+            hysteresis_ratio=tactics.edge_hysteresis_ratio,
+        )
+        self._tactics_enabled = True
+        self.logger.info(
+            "Stage 6/7 analysis enabled: formation window %d frames "
+            "(min confidence %.2f), max connection distance %.1f m "
+            "(k=%d neighbours).",
+            tactics.formation_window,
+            tactics.formation_min_confidence,
+            tactics.max_connection_distance,
+            tactics.connection_k_neighbors,
+        )
+
+    def _tactics_positions(self, tracks: List[TrackedObject]) -> List[tuple]:
+        """
+        ``(track_id, team_label, PitchCoordinate)`` for every player that has a
+        pitch position this frame - the shared input format of the Stage 6
+        formation analyzer and the Stage 7 graph builder.
+
+        Also stamps ``pitch_coordinate`` onto each track, which is how the
+        Stage 5 renderer learns where to draw the player on the panel.
+        """
+        positions: List[tuple] = []
+        for track in tracks:
+            if track.class_name != "player":
+                continue
+            coordinate = self.pitch_by_track.get(track.track_id)
+            if coordinate is None:
+                continue
+            track.pitch_coordinate = coordinate
+            positions.append(
+                (
+                    track.track_id,
+                    team_label(self.team_by_track.get(track.track_id)),
+                    coordinate,
+                )
+            )
+        return positions
 
     # ------------------------------------------------------------------ #
     # Stages

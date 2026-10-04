@@ -134,6 +134,24 @@ pitch:
   # Draw the top-down radar inset on the annotated video (needs calibration).
   show_radar: true
 
+# Stage 6 (formation) + Stage 7 (teammate graph) tactical analysis.
+# Both run per frame inside the --stage5 side-by-side output.
+tactics:
+  # Frames averaged when deciding the displayed formation (temporal window);
+  # higher = slower but much more stable labels.
+  formation_window: 10
+  # Smoothed confidence below this -> formation is shown as UNKNOWN.
+  formation_min_confidence: 0.6
+  # Stage 7: teammates further apart than this (meters) are never linked,
+  # no matter how many neighbours they have. Lower = sparser, tighter mesh.
+  max_connection_distance: 25.0
+  # Stage 7: each player links to at most its k nearest teammates inside the
+  # distance cap - keeps the graph from becoming fully connected.
+  connection_k_neighbors: 3
+  # Stage 7: an existing edge survives up to max_connection_distance * (1 + ratio)
+  # before dropping. Hysteresis stops edges flickering as players hover at the cap.
+  edge_hysteresis_ratio: 0.15
+
 # Logging configuration
 logging:
   # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL

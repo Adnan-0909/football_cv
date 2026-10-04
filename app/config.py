@@ -150,6 +150,23 @@ class LoggingConfig:
 
 
 @dataclass
+class TacticsConfig:
+    """Stage 6/7 tactical analysis settings (formations + teammate graph)."""
+    # Sliding window (frames) used to smooth formation labels over time.
+    formation_window: int = 10
+    # Below this smoothed confidence the formation is reported as UNKNOWN.
+    formation_min_confidence: float = 0.6
+    # Stage 7: teammates farther apart than this (metres) are never linked.
+    max_connection_distance: float = 25.0
+    # Stage 7: each player links only to its k nearest teammates (within the
+    # distance cap), which keeps the graph sparse instead of fully connected.
+    connection_k_neighbors: int = 3
+    # Stage 7: an established edge survives up to this extra distance ratio
+    # before dropping - temporal hysteresis so edges do not flicker.
+    edge_hysteresis_ratio: float = 0.15
+
+
+@dataclass
 class AppConfig:
     """Master application configuration aggregate."""
     project_root: Path = PROJECT_ROOT
@@ -158,6 +175,7 @@ class AppConfig:
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     team_classifier: TeamClassifierConfig = field(default_factory=TeamClassifierConfig)
     pitch: PitchConfig = field(default_factory=PitchConfig)
+    tactics: TacticsConfig = field(default_factory=TacticsConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     def ensure_directories(self) -> None:
@@ -280,6 +298,16 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> AppConfig:
         show_radar=bool(p_raw.get("show_radar", True)),
     )
 
+    # Parse TacticsConfig (Stage 6 formation smoothing, Stage 7 graph limits)
+    ta_raw = raw_cfg.get("tactics", {})
+    tactics_cfg = TacticsConfig(
+        formation_window=int(ta_raw.get("formation_window", 10)),
+        formation_min_confidence=float(ta_raw.get("formation_min_confidence", 0.6)),
+        max_connection_distance=float(ta_raw.get("max_connection_distance", 25.0)),
+        connection_k_neighbors=int(ta_raw.get("connection_k_neighbors", 3)),
+        edge_hysteresis_ratio=float(ta_raw.get("edge_hysteresis_ratio", 0.15)),
+    )
+
     # Parse LoggingConfig
     l_raw = raw_cfg.get("logging", {})
     log_cfg = LoggingConfig(
@@ -295,6 +323,7 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> AppConfig:
         tracker=tracker_cfg,
         team_classifier=team_cfg,
         pitch=pitch_cfg,
+        tactics=tactics_cfg,
         logging=log_cfg,
     )
 
