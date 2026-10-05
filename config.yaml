@@ -83,27 +83,47 @@ team_classifier:
   # --- two-team clustering --- #
   # Frames between colour-model refits (keeps TEAM_A/TEAM_B meanings stable)
   recluster_interval: 15
-  # Pooled observations / distinct players required before the first fit
+  # Pooled observations / distinct players required before the first fit.
+  # The pooled features are only *evidence* that fitting may be attempted:
+  # the clustering itself runs on one vote per player (the median of their
+  # recent features), so a single bad frame cannot drag a player's colour.
   min_cluster_samples: 40
   min_cluster_tracks: 4
   # Caps keeping clustering cheap
   max_cluster_samples: 4000
+  # Recent features per player that one vote is the median of
   max_samples_per_track: 12
+  # A player only votes in a fit once they have at least this many
+  # observations: the first boxes of a new track sit on grass/background, so
+  # an immature median would poison the very first models (the old pipeline
+  # fitted at frame 3 on such garbage).
+  min_vote_features: 6
   # k-means effort for the team clustering itself
   kmeans_iters: 25
   kmeans_restarts: 3
   # Clusters closer than this multiple of their own spread count as one blob
   # (similar kits) -> no model, everyone stays UNKNOWN instead of being split
-  # arbitrarily. Lower to ~2.0 if teams with close colours stay UNKNOWN.
-  min_separation_ratio: 3.0
+  # arbitrarily. Kept at 2.0 for this footage: distant-camera shots separate
+  # white-vs-navy by ~2.2-2.8 robust spreads (a code default of 3.0 stays in
+  # TeamClassifierConfig for cleaner sources).
+  min_separation_ratio: 2.0
+  # Minimum absolute distance between the two cluster centres in feature
+  # space. The ratio gate above is scale-free: two halves of ONE kit are
+  # tight, so their radii are tiny and even a 0.03-0.09 gap clears it - the
+  # fits then label bright vs dim white as two teams. This floor rejects
+  # sub-splits (observed <= 0.09) while genuine kit pairs here are >= 0.11.
+  min_separation_distance: 0.10
   # Per-cluster radius floor as a fraction of the cluster separation
   radius_floor_ratio: 0.05
-  # Smallest share of pooled observations any team cluster may hold. A split
-  # whose minority is smaller than this is degenerate - e.g. a lone referee
-  # forms one cluster while both real kits merge into the other (common on
-  # wide shots where tiny crops blur the kit colours) - so the fit is refused
-  # instead of labelling the whole pitch TEAM_A.
-  min_minority_share: 0.15
+  # Smallest share of votes any team cluster may hold. A split whose minority
+  # is smaller than this found outliers, not teams - e.g. a lone referee or
+  # grass-dominated players form one cluster while both real kits merge into
+  # the other. Such clusters are pruned and the fit retried (up to two
+  # prunes); if still degenerate the fit is refused instead of labelling the
+  # whole pitch TEAM_A. Real footage carries 2-4 outlier votes among 10-16
+  # players (~15-25%), so 0.15 failed to prune them; 0.25 prunes the junk
+  # while a genuine small side (>= a quarter of the votes) still counts.
+  min_minority_share: 0.25
 
   # --- assignment + temporal smoothing --- #
   # Rolling observation window kept per player

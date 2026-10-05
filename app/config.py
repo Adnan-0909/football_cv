@@ -89,25 +89,40 @@ class TeamClassifierConfig:
     min_cluster_samples: int = 40
     min_cluster_tracks: int = 4
     # Caps keeping one clip cheap: pool at most this many samples in total,
-    # taking at most this many recent features per player.
+    # taking at most this many recent features per player (a player's vote is
+    # the median of that same window).
     max_cluster_samples: int = 4000
     max_samples_per_track: int = 12
+    # A player only votes in a fit once they have at least this many
+    # observations: a brand-new track's first boxes sit on grass/background, so
+    # an immature median would poison the very first models.
+    min_vote_features: int = 6
     # k-means effort for the team clustering itself.
     kmeans_iters: int = 25
     kmeans_restarts: int = 3
     # Clusters closer than this multiple of their own spread are considered
     # one blob (similar kits) -> the model is refused and everyone stays
-    # UNKNOWN instead of being split arbitrarily.
+    # UNKNOWN instead of being split arbitrarily. 3.0 is the conservative
+    # default; config.yaml lowers it for distant-camera footage where the
+    # white-vs-navy gap is only ~2.2-2.8 robust spreads.
     min_separation_ratio: float = 3.0
+    # Minimum absolute distance between the two centres in feature space. The
+    # ratio gate above is scale-free, so a sub-split of ONE kit (both halves
+    # tight => tiny radii) clears it easily; this floor refuses such
+    # near-identical pairs while genuine kit pairs sit far above it.
+    min_separation_distance: float = 0.10
     # Per-cluster radius is floored at this fraction of the separation so an
     # extremely tight cluster cannot reject everything as "too far".
     radius_floor_ratio: float = 0.05
-    # Smallest share of pooled observations any team cluster may hold. A split
-    # whose minority is smaller than this is degenerate (e.g. a lone referee
-    # forms one cluster while both real kits merge into the other, which is
-    # what happens on wide shots with tiny, background-contaminated crops),
-    # so the whole fit is refused instead of labelling everyone wrongly.
-    min_minority_share: float = 0.15
+    # Smallest share of votes any team cluster may hold. A split whose
+    # minority is smaller than this found outliers rather than teams (lone
+    # referee, grass-dominated players, background-flickered crops), so that
+    # cluster is pruned and the fit retried; if no balanced split appears the
+    # fit is refused instead of labelling everyone wrongly. Real footage shows
+    # 2-4 outlier votes among 10-16 players (~15-25%), so 0.15 was too low to
+    # prune them: 0.25 keeps a genuine small side (>= a quarter of votes) while
+    # pruning the junk.
+    min_minority_share: float = 0.25
 
     # --- assignment + temporal smoothing ---------------------------------- #
     # Rolling observation window per player (frames kept for the mean colour).
@@ -282,8 +297,10 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> AppConfig:
         kmeans_iters=int(tc_raw.get("kmeans_iters", 25)),
         kmeans_restarts=int(tc_raw.get("kmeans_restarts", 3)),
         min_separation_ratio=float(tc_raw.get("min_separation_ratio", 3.0)),
+        min_separation_distance=float(tc_raw.get("min_separation_distance", 0.10)),
         radius_floor_ratio=float(tc_raw.get("radius_floor_ratio", 0.05)),
-        min_minority_share=float(tc_raw.get("min_minority_share", 0.15)),
+        min_minority_share=float(tc_raw.get("min_minority_share", 0.25)),
+        min_vote_features=int(tc_raw.get("min_vote_features", 6)),
         feature_history=int(tc_raw.get("feature_history", 32)),
         mean_window=int(tc_raw.get("mean_window", 10)),
         unknown_radius_scale=float(tc_raw.get("unknown_radius_scale", 2.5)),

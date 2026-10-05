@@ -327,6 +327,73 @@ def test_a_lone_referee_cannot_steal_the_split():
     assert not classifier.model_ready
 
 
+def test_a_lone_outlier_is_pruned_and_both_kits_still_form():
+    """
+    Companion to the refusal test: with both kits present, prune must recover.
+
+    The degenerate ``{outlier} vs {merged kits}`` first split is pruned and
+    retried until white and navy occupy their own clusters. Whatever split
+    k-means proposes, the fit must come up ready - never stay dead (that would
+    keep everyone UNKNOWN) and never merge the two kits into one cluster.
+    """
+    white = (245, 245, 245)
+    navy = (40, 45, 200)
+    orange = (0, 140, 255)
+    crops = [np.full((80, 60, 3), white, dtype=np.uint8)] * 10
+    crops += [np.full((80, 60, 3), navy, dtype=np.uint8)] * 8
+    crops.append(np.full((80, 60, 3), orange, dtype=np.uint8))
+
+    classifier = TeamClassifier()
+    classifier.fit(crops)
+
+    assert classifier.model_ready
+
+
+def test_a_track_needs_a_mature_window_before_voting():
+    """
+    A brand-new track's first boxes sit on grass/background, so its median is
+    background, not jersey: it must abstain from fitting until it has
+    collected a few observations.
+    """
+    clf = TeamClassifier()
+    specs = two_team_specs(*KIT_PAIRS["blue_red"], per_team=6)
+    live = {s.track_id for s in specs}
+
+    play(clf, specs, frames=3)  # 3 observations each - below the maturity bar
+    _, _, n_tracks = clf._collect_fit_samples(live)
+    assert n_tracks == 0, "immature tracks must abstain from the fit"
+
+    play(clf, specs, frames=4)  # 7 observations each - mature enough
+    _, votes, n_tracks = clf._collect_fit_samples(live)
+    assert n_tracks == len(specs)
+    assert votes.shape == (len(specs), 3)
+
+
+def test_only_live_tracks_vote_in_a_refit():
+    """
+    Retired tracks must not pollute a refit.
+
+    When the camera cuts, the old players disappear but their feature states
+    stay behind (kept for label history). Only players visible *now* may vote
+    in the next fit - otherwise, after a few cuts, long-gone colours (old
+    referees, advertisement boards) would dominate the pool and decide the
+    teams of the current shot.
+    """
+    clf = TeamClassifier()
+    old = two_team_specs(*KIT_PAIRS["blue_red"], per_team=6)
+    play(clf, old, frames=30)
+
+    new = two_team_specs(*KIT_PAIRS["green_white"], per_team=4, first_id=101)
+    play(clf, new, frames=10)  # the old players are gone from the frame now
+
+    live_ids = {s.track_id for s in new}
+    _, votes, n_tracks = clf._collect_fit_samples(live_ids)
+
+    assert len(clf._states) > len(new), "retired states should still exist for label history"
+    assert n_tracks == len(new), "only the currently visible tracks may vote"
+    assert votes.shape == (len(new), 3)
+
+
 def test_identical_kits_stay_unknown():
     """One blob instead of two teams -> no model, nobody gets a forced label."""
     only_color = KIT_PAIRS["blue_red"][0]
@@ -336,6 +403,28 @@ def test_identical_kits_stay_unknown():
     history = play(classifier, specs, frames=30)
 
     assert all(label is None for frame in history for label in frame.values())
+
+
+def test_a_sub_split_of_one_kit_is_refused():
+    """
+    Two shades of one jersey are not two teams.
+
+    Tight clusters have essentially zero radius, so a bright-vs-dim split of
+    the same kit clears the *spread-ratio* gate with room to spare (on the
+    footage such sub-splits measured 0.03-0.09 in feature space with ratios
+    above 2). Adopting it would label one jersey as TEAM_A and TEAM_B - the
+    absolute centre-distance floor must refuse the fit instead, and with no
+    model nobody can be mislabelled.
+    """
+    bright = (245, 245, 245)
+    dim = (210, 210, 210)  # same hue, lower value -> ~0.07 apart, not a kit pair
+    crops = [np.full((80, 60, 3), bright, dtype=np.uint8)] * 10
+    crops += [np.full((80, 60, 3), dim, dtype=np.uint8)] * 8
+
+    classifier = TeamClassifier()
+    classifier.fit(crops)
+
+    assert not classifier.model_ready
 
 
 def test_far_away_player_stays_unknown_while_others_are_labelled():

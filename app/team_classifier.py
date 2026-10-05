@@ -26,10 +26,15 @@ the footage itself:
    Crops that are too small (far-away players) or whose pixels do not form one
    dominant region (heavy occlusion, ads / background dominating the box) are
    rejected as *unreliable* and simply produce no observation.
-3. **Two-team clustering.** A k-means with ``n_teams`` clusters runs over the
-   pooled features of *all* players. It is refitted periodically
-   (``recluster_interval``) and each refit is re-anchored to the previous one,
-   so the meaning of TEAM_A / TEAM_B never flips mid-run.
+3. **Two-team clustering.** A k-means with ``n_teams`` clusters runs over one
+   *vote* per player - the median of their rolling feature window - so a
+   single contaminated frame cannot drag a colour and a lone referee only
+   ever votes once. A fit whose smaller cluster looks like an outlier group
+   (referee, grass-dominated players) is pruned and retried, and the last
+   gate-passing structure wins, so the model ends up as ``{kit A} | {kit B}``
+   rather than ``{odd colours} | {everyone merged}``. The model is refitted
+   periodically (``recluster_interval``) and each refit is re-anchored to the
+   previous one, so the meaning of TEAM_A / TEAM_B never flips mid-run.
 4. **Temporal smoothing.** Each track keeps a rolling feature window. A team is
    committed only after ``min_consistent_frames`` consecutive agreements and is
    only switched after ``switch_frames`` consecutive contradicting ones, so an
@@ -64,7 +69,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 from itertools import permutations
-from typing import Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
@@ -78,6 +83,19 @@ logger = logging.getLogger(__name__)
 # cluster is a *robust* statistic so that a handful of absorbed outliers
 # (referee, goalkeeper, background-heavy box) cannot inflate it.
 _MAD_TO_SIGMA = 1.4826
+
+# How many times a degenerate fit may prune its outlier cluster and retry
+# before being refused. Two (= three chain rounds total) was the sweet spot
+# on this footage: one prune usually turns "{odd colours} | {merged kits}"
+# into "{kit A} | {kit B}", a second covers double-outlier pools, and a third
+# only starts sub-splitting single kits into garbage candidates.
+_MAX_PRUNE_ROUNDS = 2
+
+# While the smaller cluster of a fit holds less than this share of the votes
+# it is treated as a suspect outlier group and pruned; from 40% upwards both
+# sides are substantial enough to be real teams (they can never both exceed
+# 50%, so this still stops on any balanced split).
+_STOP_SHARE = 0.4
 
 # Public team identifiers. TEAM_A / TEAM_B are *relative* labels: which
 # real-world kit becomes A and which becomes B is decided by clustering the
@@ -259,7 +277,11 @@ class TeamClassifier:
         """
         for track in tracks:
             self._observe(track, frame)
-        self._maybe_fit(frame_index)
+        # Only players visible *now* vote in the next fit: states of retired
+        # tracks are kept for their label history, but their months-old colours
+        # must never pollute a refit (after a camera cut the pool would
+        # otherwise be dominated by players who left the pitch ages ago).
+        self._maybe_fit(frame_index, {track.track_id for track in tracks})
         return {track.track_id: self._classify(self._state(track.track_id)) for track in tracks}
 
     def predict_team(self, frame: np.ndarray, tracked_player: TrackedObject) -> Optional[int]:
@@ -426,27 +448,46 @@ class TeamClassifier:
         if feature is not None:
             self._state(track.track_id).features.append(feature)
 
-    def _collect_fit_samples(self) -> Tuple[np.ndarray, int]:
-        """Pool recent per-track features (capped) for the clustering round."""
+    def _collect_fit_samples(self, live_ids: Set[int]) -> Tuple[np.ndarray, np.ndarray, int]:
+        """Pool recent per-track features (capped) plus one "vote" per track.
+
+        Only tracks in ``live_ids`` (currently visible players) contribute:
+        states of retired tracks are kept for their label history, but their
+        stale colours must not enter a refit - after a camera cut the pool
+        would otherwise be dominated by players long gone from the pitch.
+
+        The pooled features only prove that a fit may be attempted; the
+        clustering itself runs on the votes - the per-track *median* feature -
+        so a single background-contaminated frame (grass, crowd, advertisement
+        boards) cannot drag a player's colour, and a lone referee only ever
+        contributes one vote instead of a whole cluster's worth of samples.
+        Tracks with fewer than ``min_vote_features`` observations abstain: the
+        first boxes of a new track usually sit on grass, so their median is
+        background, not jersey.
+        """
         chunks: List[np.ndarray] = []
+        votes: List[np.ndarray] = []
         tracks_used = 0
         cap = self.config.max_samples_per_track
-        for state in self._states.values():
-            if not state.features:
+        for track_id, state in self._states.items():
+            if track_id not in live_ids or len(state.features) < self.config.min_vote_features:
                 continue
             recent = list(state.features)[-cap:]
-            chunks.append(np.stack(recent, axis=0))
+            chunk = np.stack(recent, axis=0)
+            chunks.append(chunk)
+            votes.append(np.median(chunk, axis=0))
             tracks_used += 1
         if not chunks:
-            return np.empty((0, 3), dtype=np.float32), 0
+            empty = np.empty((0, 3), dtype=np.float32)
+            return empty, empty.copy(), 0
 
         samples = np.concatenate(chunks, axis=0)
         if samples.shape[0] > self.config.max_cluster_samples:
             idx = self._rng.choice(samples.shape[0], size=self.config.max_cluster_samples, replace=False)
             samples = samples[idx]
-        return samples, tracks_used
+        return samples, np.stack(votes, axis=0), tracks_used
 
-    def _maybe_fit(self, frame_index: int) -> None:
+    def _maybe_fit(self, frame_index: int, live_ids: Set[int]) -> None:
         """Refit (or first-fit) the colour model when due and enough data exists."""
         # First attempt runs as soon as the samples suffice; every later attempt
         # (successful or not - e.g. kits that only become separable once both
@@ -454,7 +495,7 @@ class TeamClassifier:
         if self._attempts > 0 and (frame_index - self._last_fit_index) < self.config.recluster_interval:
             return
 
-        samples, n_tracks = self._collect_fit_samples()
+        samples, votes, n_tracks = self._collect_fit_samples(live_ids)
         if (
             samples.shape[0] < self.config.min_cluster_samples
             or n_tracks < self.config.min_cluster_tracks
@@ -463,66 +504,90 @@ class TeamClassifier:
 
         self._attempts += 1
         self._last_fit_index = frame_index
-        self._publish(self._fit_model(samples))
+        self._publish(self._fit_model(votes))
 
     def _fit_model(self, samples: np.ndarray) -> Optional[_TeamModel]:
-        """Cluster all observations into ``n_teams`` groups (None if not separable)."""
-        centers, labels, _ = _kmeans(
-            samples,
-            self.config.n_teams,
-            iters=self.config.kmeans_iters,
-            restarts=self.config.kmeans_restarts,
-            rng=self._rng,
-        )
-        if centers.shape[0] < 2:
-            return None
+        """Cluster the observations into ``n_teams`` groups (None if not separable).
 
-        # Degenerate split guard: a lone referee/keeper (or any odd colour far
-        # from both kits) can win one k-means cluster while both real kits
-        # merge into the other - especially on wide shots whose tiny crops are
-        # blurred by background pixels. Two real teams always hold a
-        # comparable share of the observations, so a minority below
-        # min_minority_share means the split found outliers, not teams: refuse
-        # the fit and let the previous model (or UNKNOWN) stand.
-        counts = np.bincount(labels, minlength=centers.shape[0])
-        minority_share = float(counts.min()) / max(int(counts.sum()), 1)
-        if minority_share < self.config.min_minority_share:
-            return None
+        k-means runs on the full vote set first; while its smaller cluster
+        holds less than ``_STOP_SHARE`` of the votes, that cluster is treated
+        as a suspect outlier group (a lone referee or keeper, grass-dominated
+        players - on wide shots they form one far-away cluster while both real
+        kits merge into the other), it is pruned and the fit retried. Every
+        structure that passes the separation gates - spread ratio *and*
+        absolute centre distance - is remembered and the **last** one wins:
+        the chain ends on ``{kit A} | {kit B}`` as soon as both sides are
+        balanced, whereas pruning a genuine small side makes the refit on the
+        remaining votes fail the gates, leaving that side's structure as the
+        last valid candidate. If no candidate ever passes the gates, or the
+        final one holds less than ``min_minority_share``, the fit is refused
+        and the previous model (or UNKNOWN) stands.
+        """
+        work = samples
+        best: Optional[Tuple[float, _TeamModel]] = None  # (minority share, model)
+        for _ in range(1 + _MAX_PRUNE_ROUNDS):
+            centers, labels, _ = _kmeans(
+                work,
+                self.config.n_teams,
+                iters=self.config.kmeans_iters,
+                restarts=self.config.kmeans_restarts,
+                rng=self._rng,
+            )
+            if centers.shape[0] < 2:
+                break
+            counts = np.bincount(labels, minlength=centers.shape[0])
+            minority_share = float(counts.min()) / max(int(counts.sum()), 1)
 
-        radii = np.empty(centers.shape[0], dtype=np.float64)
-        for j in range(centers.shape[0]):
-            members = samples[labels == j]
-            if members.shape[0] >= 2:
-                diff = members - centers[j]
-                dists = np.sqrt(np.sum(diff * diff, axis=1))
-                # Robust spread: the median is barely moved by outliers, so a
-                # referee/keeper accidentally grouped with a team cannot widen
-                # its own acceptance radius.
-                radii[j] = float(np.median(dists) * _MAD_TO_SIGMA)
-            else:
-                radii[j] = 0.0
+            radii = np.empty(centers.shape[0], dtype=np.float64)
+            for j in range(centers.shape[0]):
+                members = work[labels == j]
+                if members.shape[0] >= 2:
+                    diff = members - centers[j]
+                    dists = np.sqrt(np.sum(diff * diff, axis=1))
+                    # Robust spread: the median is barely moved by outliers,
+                    # so a referee/keeper accidentally grouped with a team
+                    # cannot widen its own acceptance radius.
+                    radii[j] = float(np.median(dists) * _MAD_TO_SIGMA)
+                else:
+                    radii[j] = 0.0
 
-        pairwise = [
-            float(np.linalg.norm(centers[i] - centers[j]))
-            for i in range(centers.shape[0])
-            for j in range(i + 1, centers.shape[0])
-        ]
-        separation = min(pairwise)
-        mean_radius = float(radii.mean())
+            pairwise = [
+                float(np.linalg.norm(centers[i] - centers[j]))
+                for i in range(centers.shape[0])
+                for j in range(i + 1, centers.shape[0])
+            ]
+            separation = min(pairwise)
+            mean_radius = float(radii.mean())
 
-        # One blob instead of two kits (very similar jerseys): refuse to label
-        # rather than split players arbitrarily.
-        if separation < 1e-6 or separation < self.config.min_separation_ratio * max(mean_radius, 1e-6):
-            return None
+            # One blob instead of two kits (very similar jerseys) never
+            # qualifies as a candidate - rather than split players arbitrarily.
+            # The ratio alone is not enough: a sub-split of a SINGLE kit is
+            # tight (tiny radii) and clears it easily, yet labelling bright vs
+            # dim white as two teams is exactly the failure we are fighting.
+            # The absolute floor rejects near-identical pairs instead, while
+            # genuine kit pairs on this footage sit far above it.
+            if separation >= self.config.min_separation_distance and (
+                separation >= self.config.min_separation_ratio * max(mean_radius, 1e-6)
+            ):
+                # Radius floor: an extremely tight cluster must not reject
+                # perfectly normal observations through float noise.
+                model = _TeamModel(
+                    centroids=centers.astype(np.float32),
+                    radii=np.maximum(radii, self.config.radius_floor_ratio * separation).astype(np.float32),
+                    separation=separation,
+                )
+                best = (minority_share, model)  # last gate-passing structure
 
-        # Floor the per-cluster radius so an extremely tight cluster cannot
-        # reject perfectly normal observations through float noise.
-        radii = np.maximum(radii, self.config.radius_floor_ratio * separation)
-        return _TeamModel(
-            centroids=centers.astype(np.float32),
-            radii=radii.astype(np.float32),
-            separation=separation,
-        )
+            if minority_share >= _STOP_SHARE:
+                break  # both sides substantial: a real split
+            keep = labels == int(np.argmax(counts))  # drop the suspect minority
+            if bool(np.all(keep)) or int(np.sum(keep)) < 4:
+                break  # nothing left to prune, or too few votes for two clusters
+            work = work[keep]
+
+        if best is None or best[0] < self.config.min_minority_share:
+            return None  # no valid structure, or a degenerate leftover
+        return best[1]
 
     def _publish(self, model: Optional[_TeamModel]) -> None:
         """Adopt a fresh model, keeping TEAM_A / TEAM_B meanings stable."""
