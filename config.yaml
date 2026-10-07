@@ -7,8 +7,20 @@ model:
   # Path to YOLO model weights (e.g. yolov8s.pt, yolov8n.pt, yolov8x.pt, or custom trained weights)
   # Missing weights are downloaded automatically on first run.
   weights_path: "models/yolov8s.pt"
-  # Minimum confidence threshold for player & ball detections (0.0 to 1.0)
+  # Minimum confidence for detections that are DRAWN / reported (HUD count,
+  # ball marker). Kept separate from the tracker's candidate floor below.
   confidence_threshold: 0.35
+  # Inference resolution for YOLO. 0 = auto: source frame width rounded down
+  # to a multiple of 32 (at least 640). The previous implicit default was
+  # Ultralytics' 640, which processes 1280-wide broadcast frames at half
+  # resolution and loses distant players.
+  imgsz: 0
+  # Detections at/above this confidence are produced as *candidates* for the
+  # tracker even when below confidence_threshold. Keep it at ByteTrack's
+  # track_low_thresh (0.1) so the low-score rescue stage can re-associate
+  # players through short occlusions; new tracks still require
+  # tracker.new_track_thresh (0.6), so crowd false positives cannot spawn IDs.
+  candidate_threshold: 0.10
   # Non-Maximum Suppression (IoU) threshold
   iou_threshold: 0.5
   # Hardware device: "cpu", "cuda", or "0" for GPU
@@ -58,10 +70,10 @@ team_classifier:
   # Upper-body (torso) crop inside each player bounding box, as fractions of
   # the box. This is what keeps grass, legs and most background out of the
   # colour sample.
-  torso_crop_top: 0.2
-  torso_crop_bottom: 0.6
+  torso_crop_top: 0.25
+  torso_crop_bottom: 0.55
   # Columns trimmed on each side of the box (arms / background bleeding in)
-  torso_crop_side: 0.15
+  torso_crop_side: 0.20
 
   # --- dominant jersey colour extraction --- #
   # Pixel clusters used to find the crop's dominant colour region
@@ -72,11 +84,10 @@ team_classifier:
   max_crop_pixels: 512
   # The dominant region must cover at least this share of the crop, otherwise
   # the observation is rejected (occlusion, advertisement boards in the box).
-  # Raise towards 0.6 if ads/background are leaking into the jersey colour.
-  min_dominant_ratio: 0.45
+  min_dominant_ratio: 0.35
   # Weight of brightness (V) in the colour feature: lower = more robust to
   # shadows, higher = better white-vs-black kit separation
-  value_weight: 0.5
+  value_weight: 0.8
   # Lloyd iterations for the per-crop dominant colour
   pixel_kmeans_iters: 6
 
@@ -140,8 +151,8 @@ team_classifier:
   # Consecutive agreeing frames before a team is committed to a player, and
   # consecutive contradicting frames before it may be switched. Higher values
   # = more stable IDs, slower to react.
-  min_consistent_frames: 5
-  switch_frames: 8
+  min_consistent_frames: 2
+  switch_frames: 12
   # Seed for the clustering (deterministic output for a given clip)
   random_seed: 0
 
