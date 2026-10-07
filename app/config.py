@@ -22,7 +22,19 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 class ModelConfig:
     """Settings for YOLO object detection."""
     weights_path: Path = field(default_factory=lambda: PROJECT_ROOT / "models" / "yolov8s.pt")
+    # Display/report quality gate: detections drawn and reported (HUD, ball
+    # marker) need at least this confidence.
     confidence_threshold: float = 0.35
+    # Inference resolution. 0 = auto (source frame width, multiple of 32,
+    # min 640); > 0 forces that size. Ultralytics' implicit default of 640
+    # downscales 1280-wide broadcast footage and measurably loses distant
+    # players (person detections at conf >= 0.35 roughly double at native
+    # width on the sample match).
+    imgsz: int = 0
+    # Tracker candidate floor: detections at/above this (but below
+    # confidence_threshold) are still produced so ByteTrack's low-score
+    # rescue stage can re-associate players through short occlusions.
+    candidate_threshold: float = 0.10
     iou_threshold: float = 0.5
     device: str = "cpu"
     player_class_id: int = 0
@@ -246,6 +258,8 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> AppConfig:
     model_cfg = ModelConfig(
         weights_path=_resolve_path(weights_raw),
         confidence_threshold=float(m_raw.get("confidence_threshold", 0.35)),
+        imgsz=int(m_raw.get("imgsz", 0)),
+        candidate_threshold=float(m_raw.get("candidate_threshold", 0.10)),
         iou_threshold=float(m_raw.get("iou_threshold", 0.5)),
         device=str(m_raw.get("device", "cpu")),
         player_class_id=int(m_raw.get("player_class_id", 0)),

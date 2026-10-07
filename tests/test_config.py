@@ -25,6 +25,9 @@ def test_load_default_config():
     assert config.model.weights_path.is_absolute()
     assert config.video.input_path.is_absolute()
     assert config.video.output_path.is_absolute()
+    # Detection-for-tracking vs detection-for-display separation.
+    assert config.model.imgsz == 0            # 0 = auto (source width)
+    assert 0.0 < config.model.candidate_threshold <= config.model.confidence_threshold
 
 
 def test_directory_creation():
@@ -41,6 +44,13 @@ def test_custom_values():
     m_cfg = ModelConfig(confidence_threshold=0.6, device="cuda")
     assert m_cfg.confidence_threshold == 0.6
     assert m_cfg.device == "cuda"
+
+
+def test_model_config_defaults_for_imgsz_and_candidates():
+    """Defaults keep the documented behaviour without a config file."""
+    m_cfg = ModelConfig()
+    assert m_cfg.imgsz == 0
+    assert m_cfg.candidate_threshold == 0.10
 
 
 def test_team_classifier_config_defaults():

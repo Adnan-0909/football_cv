@@ -11,7 +11,7 @@ types directly.
 from dataclasses import dataclass
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from app.config import ModelConfig
@@ -36,6 +36,41 @@ class Detection:
     class_name: str
 
 
+def inference_settings(config: ModelConfig, frame_width: int) -> Tuple[int, float]:
+    """
+    ``(imgsz, confidence floor)`` used to run inference for one frame.
+
+    Two separations of responsibility live here:
+
+    * **imgsz** - ``config.imgsz`` when set (> 0), otherwise the source frame
+      width rounded down to a multiple of 32, never below 640. Ultralytics'
+      implicit default of 640 would downscale 1280-wide broadcast footage
+      before inference, which measurably loses distant players (evidence:
+      person detections at conf >= 0.35 roughly double at native width).
+    * **floor** - the lower of the display gate and ``candidate_threshold``:
+      detections between the two thresholds exist only as *candidates* for the
+      tracker (ByteTrack's stage-2 rescue works on detections down to
+      ``track_low_thresh``), while drawing/reporting stays gated at
+      ``confidence_threshold``. Using ``min`` guarantees the display gate can
+      never be undercut by a higher candidate setting.
+
+    Args:
+        config: Model settings.
+        frame_width: Source frame width in pixels (0 when unknown).
+
+    Returns:
+        Tuple of (imgsz, confidence floor).
+    """
+    if frame_width and frame_width > 0:
+        imgsz = max(640, (int(frame_width) // 32) * 32)
+    else:
+        imgsz = 640
+    if config.imgsz and config.imgsz > 0:
+        imgsz = int(config.imgsz)
+    floor = min(config.confidence_threshold, config.candidate_threshold)
+    return imgsz, float(floor)
+
+
 class FootballDetector:
     """
     Wrapper for Ultralytics YOLO model for football scene detection.
@@ -44,6 +79,11 @@ class FootballDetector:
     - Players (outfield players and goalkeepers)
     - Referees
     - Football / Ball
+
+    The detector deliberately works with a low *candidate* floor (see
+    :func:`inference_settings`) so the tracker receives the weak detections
+    ByteTrack's low-score rescue stage is designed for; consumers that draw
+    or report detections filter at ``confidence_threshold`` themselves.
     """
 
     def __init__(self, config: Optional[ModelConfig] = None) -> None:
@@ -103,9 +143,11 @@ class FootballDetector:
         if self.model is None:
             self.load_model()
 
+        imgsz, floor = inference_settings(self.config, frame.shape[1])
         results = self.model.predict(
             source=frame,
-            conf=self.config.confidence_threshold,
+            conf=floor,
+            imgsz=imgsz,
             iou=self.config.iou_threshold,
             device=self.config.device,
             classes=sorted({self.config.player_class_id, self.config.ball_class_id}),
