@@ -593,7 +593,13 @@ class TacticalPipeline:
             if track.class_name == "ball":
                 self.ball_pitch = coordinate
             else:
-                self.pitch_by_track[track.track_id] = coordinate
+                # Discard projections far outside pitch boundaries (crowd, close-ups, camera cuts)
+                pitch_margin = 12.0
+                if (
+                    -pitch_margin <= coordinate.x <= self.config.pitch.length_meters + pitch_margin
+                    and -pitch_margin <= coordinate.y <= self.config.pitch.width_meters + pitch_margin
+                ):
+                    self.pitch_by_track[track.track_id] = coordinate
 
     def _update_teams(
         self,
