@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 
 from app.config import TeamClassifierConfig
-from app.team_classifier import TEAM_A, TEAM_B, TeamClassifier, team_label
+from app.team_classifier import TEAM_A, TEAM_B, TeamClassifier, team_label, torso_roi
 from app.tracker import TrackedObject
 
 FRAME_SIZE = (640, 360)  # (width, height)
@@ -578,3 +578,49 @@ def test_config_exposes_smoothing_thresholds():
     assert classifier.config.switch_frames == 12
     assert classifier.config.min_consistent_frames == 3
     assert classifier.config.n_teams == 2
+
+
+def test_torso_roi_matches_the_crop_geometry():
+    """The debug overlay ROI must be exactly the pixels the classifier reads."""
+    cfg = TeamClassifierConfig()  # top 0.2, bottom 0.6, side 0.15 by default
+    left, top, right, bottom = torso_roi((100.0, 100.0, 200.0, 300.0), cfg)
+    assert (left, top, right, bottom) == (115, 140, 185, 220)
+
+
+def test_team_confidence_reflects_model_evidence():
+    """Clear kit evidence scores high, outlier evidence scores ~0."""
+    clf = TeamClassifier()
+    color_a, color_b = KIT_PAIRS["blue_red"]
+    crops = []
+    for _ in range(6):
+        crops.append(np.full((80, 60, 3), color_a, dtype=np.uint8))
+        crops.append(np.full((80, 60, 3), color_b, dtype=np.uint8))
+
+    # No model yet -> nothing can be confident.
+    assert clf.team_confidence(7) == 0.0
+
+    clf.fit(crops)
+    assert clf.model_ready
+    # Unknown track / no observations -> 0, never a crash.
+    assert clf.team_confidence(12345) == 0.0
+
+    # Track 7 wears kit A: solid patch, observed a few times.
+    clear_frame = make_frame()
+    draw_patch(clear_frame, (60.0, 60.0, 140.0, 240.0), color_a)
+    clear = player(7, (60.0, 60.0, 140.0, 240.0))
+    for _ in range(3):
+        clf.predict_team(clear_frame, clear)
+    conf_clear = clf.team_confidence(7)
+    assert 0.0 <= conf_clear <= 1.0
+    assert conf_clear > 0.5, f"clear kit evidence should score high, got {conf_clear}"
+
+    # Track 8 is a referee-grey blob: far outside both clusters.
+    odd_frame = make_frame()
+    draw_patch(odd_frame, (300.0, 60.0, 380.0, 240.0), (90, 90, 90))
+    odd = player(8, (300.0, 60.0, 380.0, 240.0))
+    for _ in range(3):
+        clf.predict_team(odd_frame, odd)
+    conf_odd = clf.team_confidence(8)
+    assert 0.0 <= conf_odd <= 1.0
+    assert conf_odd < 0.25, f"outlier evidence should not be confident, got {conf_odd}"
+    assert conf_clear > conf_odd

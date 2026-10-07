@@ -116,6 +116,29 @@ def team_label(team: Optional[int]) -> str:
     return TEAM_LABELS.get(team, "UNKNOWN")
 
 
+def torso_roi(
+    bbox: Sequence[float],
+    config: TeamClassifierConfig,
+) -> Tuple[int, int, int, int]:
+    """
+    Pixel rectangle ``(left, top, right, bottom)`` of the jersey ROI.
+
+    Pure geometry shared by :meth:`TeamClassifier._torso_crop` (the pixels the
+    classifier actually reads) and the ``--debug`` overlay, so the rectangle
+    drawn on screen is exactly the region being classified: the upper/middle
+    torso, with the head band, arms-outside edges, shorts/legs and most
+    grass/background trimmed away.
+    """
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    width = x2 - x1
+    height = y2 - y1
+    top = int(round(y1 + config.torso_crop_top * height))
+    bottom = int(round(y1 + config.torso_crop_bottom * height))
+    left = int(round(x1 + config.torso_crop_side * width))
+    right = int(round(x2 - config.torso_crop_side * width))
+    return left, top, right, bottom
+
+
 # ---------------------------------------------------------------------- #
 # Small dependency-free k-means (NumPy only)
 # ---------------------------------------------------------------------- #
@@ -358,15 +381,10 @@ class TeamClassifier:
     ) -> Optional[np.ndarray]:
         """Upper-body region of a bounding box (excludes grass/legs/edges)."""
         x1, y1, x2, y2 = (float(v) for v in bbox)
-        width = x2 - x1
-        height = y2 - y1
-        if width <= 1 or height <= 1 or frame is None or frame.size == 0:
+        if x2 - x1 <= 1 or y2 - y1 <= 1 or frame is None or frame.size == 0:
             return None
 
-        top = int(round(y1 + self.config.torso_crop_top * height))
-        bottom = int(round(y1 + self.config.torso_crop_bottom * height))
-        left = int(round(x1 + self.config.torso_crop_side * width))
-        right = int(round(x2 - self.config.torso_crop_side * width))
+        left, top, right, bottom = torso_roi(bbox, self.config)
 
         # Slicing clips automatically; guard against fully-empty / off-screen boxes.
         crop = frame[top:bottom, left:right]
@@ -624,6 +642,13 @@ class TeamClassifier:
     # Assignment + temporal smoothing (steps 5-6)
     # ------------------------------------------------------------------ #
 
+    def _window_mean(self, state: _TrackState) -> Optional[np.ndarray]:
+        """Mean feature of the track's most recent observations (or None)."""
+        if not state.features:
+            return None
+        window = list(state.features)[-self.config.mean_window :]
+        return np.stack(window, axis=0).mean(axis=0)
+
     def _raw_label(self, state: _TrackState) -> Optional[int]:
         """
         Nearest-team label from the current model, or ``None`` when uncertain.
@@ -634,10 +659,11 @@ class TeamClassifier:
           advertisement colour,
         * almost equally close to two clusters -> similar kits / ambiguity.
         """
-        if self._model is None or not state.features:
+        if self._model is None:
             return None
-        window = list(state.features)[-self.config.mean_window :]
-        mean = np.stack(window, axis=0).mean(axis=0)
+        mean = self._window_mean(state)
+        if mean is None:
+            return None
 
         dists = np.linalg.norm(self._model.centroids - mean[None, :], axis=1)
         nearest = int(np.argmin(dists))
@@ -686,6 +712,61 @@ class TeamClassifier:
     # ------------------------------------------------------------------ #
     # Introspection
     # ------------------------------------------------------------------ #
+
+    def team_confidence(self, track_id: int) -> float:
+        """
+        Model support (0..1) for this track's current team evidence.
+
+        Display/introspection helper for the ``--debug`` overlay. It combines
+        the two data-driven gates :meth:`_raw_label` applies, rescaled to
+        [0, 1]:
+
+        * margin - how much closer the track's mean feature is to its
+          reference centre than to the best rival (0 = ambiguous, 1 = far
+          clear of the other team),
+        * radius - how far inside the UNKNOWN radius the evidence sits
+          (0 = at/outside the outlier gate, 1 = dead centre).
+
+        The returned value is the smaller of both, so ``conf > 0`` exactly
+        when the observation would pass the gates, and the reference centre
+        is the *committed* team when one exists (confidence in the label the
+        video shows), otherwise the nearest centre. Hysteresis streaks are
+        deliberately not part of this number - it measures evidence, not
+        bookkeeping.
+
+        Args:
+            track_id: Persistent track ID.
+
+        Returns:
+            Confidence in [0, 1]; 0.0 when no model exists yet or the track
+            has no reliable observations.
+        """
+        state = self._states.get(track_id)
+        if self._model is None or state is None:
+            return 0.0
+        mean = self._window_mean(state)
+        if mean is None:
+            return 0.0
+
+        dists = np.linalg.norm(self._model.centroids - mean[None, :], axis=1)
+        ref = state.team if state.team is not None else int(np.argmin(dists))
+        if ref < 0 or ref >= dists.shape[0]:
+            ref = int(np.argmin(dists))
+        d_ref = float(dists[ref])
+        others = np.delete(dists, ref)
+        d_other = float(others.min()) if others.size else float("inf")
+
+        if np.isinf(d_other):
+            margin = 1.0  # single-cluster model: no rival to be ambiguous with
+        else:
+            margin = float(np.clip((d_other - d_ref) / max(d_other, 1e-12), 0.0, 1.0))
+
+        gate = self.config.unknown_radius_scale * float(self._model.radii[ref])
+        if gate <= 0.0:
+            radius = 1.0 if d_ref <= 0.0 else 0.0
+        else:
+            radius = float(np.clip(1.0 - d_ref / gate, 0.0, 1.0))
+        return float(min(margin, radius))
 
     def reset(self) -> None:
         """Forget every track, observation and fitted model."""
