@@ -64,6 +64,28 @@ Teams are discovered from the footage itself (no fixed colors): each player is
 labeled `TEAM_A`, `TEAM_B`, or `UNKNOWN` while uncertain (referee, goalkeeper,
 heavy occlusion, background-dominated box).
 
+### Debug overlay (`--debug`)
+
+```powershell
+python main.py --input input\match.mp4 --debug
+```
+
+Draws, on top of the normal annotation, a badge under every player with the
+team label and the team model's confidence (`TEAM_A 0.83`), plus a thin
+rectangle marking the exact jersey ROI the classifier reads. `UNKNOWN`
+badges are white; a labelled player whose evidence dropped below the weakest
+gate (< 0.25) turns red. This makes it possible to tell *detection*,
+*tracking* and *team classification* failures apart frame by frame.
+
+### Run diagnostics
+
+Every run ends with a statistics block in the log (also stored in
+`PipelineStats.diagnostics`): detections per frame (including frames with
+zero), track creations, losses, durations and bridged gaps, final/stable
+team counts, and **team-label switches per track**. Use these numbers to
+attribute missing players or unstable labels to the right stage instead of
+eyeballing the video.
+
 ### Pitch calibration (once per video)
 
 ```powershell
@@ -89,6 +111,14 @@ python main.py --input input\match.mp4 --pitch-csv output\pitch.csv
 ```
 
 `pitch.csv` columns: `frame,timestamp,player_id,team,pitch_x,pitch_y`
+
+Each video / stadium needs its own calibration. `--calibration` overrides
+`pitch.calibration_path` for one run, so two clips can coexist without
+swapping files:
+
+```powershell
+python main.py --input input\clip2.mp4 --calibration calibration\clip2.json --stage5
+```
 
 Coordinates are metres on a configurable pitch (default 105 x 68 m): origin
 `(0,0)` at one pitch corner, `x` along the length (0 = left goal line,
