@@ -260,6 +260,7 @@ class TeamClassifier:
             )
         self._states: Dict[int, _TrackState] = {}
         self._model: Optional[_TeamModel] = None
+        self._anchor_model: Optional[_TeamModel] = None
         self._rng = np.random.default_rng(self.config.random_seed)
         self._attempts = 0            # clustering rounds started
         self._last_fit_index = -10**9  # frame index of the last attempt
@@ -610,8 +611,10 @@ class TeamClassifier:
         """Adopt a fresh model, keeping TEAM_A / TEAM_B meanings stable."""
         if model is None:
             return  # indistinguishable kits: keep the previous model (or none)
-        if self._model is not None:
-            model = self._align(model, self._model)
+        if self._anchor_model is None:
+            self._anchor_model = model
+        else:
+            model = self._align(model, self._anchor_model)
         self._model = model
 
     @staticmethod
@@ -771,6 +774,7 @@ class TeamClassifier:
         """Forget every track, observation and fitted model."""
         self._states.clear()
         self._model = None
+        self._anchor_model = None
         self._attempts = 0
         self._last_fit_index = -10**9
         self._rng = np.random.default_rng(self.config.random_seed)
