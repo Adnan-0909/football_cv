@@ -145,6 +145,27 @@ def parse_arguments() -> argparse.Namespace:
             "Requires a Stage 4 calibration for player positions."
         ),
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Draw the per-player diagnostic overlay on top of the normal "
+            "annotation: team label + team-model confidence badge under each "
+            "player and the jersey ROI rectangle used for classification. "
+            "UNKNOWN players stay white, labelled players with weak evidence "
+            "(< 0.25) get a red badge."
+        ),
+    )
+    parser.add_argument(
+        "--calibration",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Pitch calibration JSON to use instead of pitch.calibration_path "
+            "from the config (one calibration per video/stadium)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -187,6 +208,8 @@ def apply_overrides(config: AppConfig, args: argparse.Namespace) -> None:
         config.video.frame_stride = max(1, args.stride)
     if args.device is not None:
         config.model.device = args.device
+    if args.calibration is not None:
+        config.pitch.calibration_path = Path(args.calibration).expanduser().resolve()
 
 
 
@@ -422,7 +445,7 @@ def main() -> int:
         logger.info("Stage 5 side-by-side output enabled (video | tactical pitch).")
 
     try:
-        stats = TacticalPipeline(config, stage5=args.stage5).run(
+        stats = TacticalPipeline(config, stage5=args.stage5, debug=args.debug).run(
             input_path=config.video.input_path,
             output_path=config.video.output_path,
         )

@@ -567,3 +567,118 @@ def test_radar_inset_drawn_only_when_calibrated(tmp_path: Path):
     panel = annotated[32:232, 8:308]
     assert count_color_pixels(panel, radar_grass, tol=10) > 5000, "radar missing"
     assert count_color_pixels(panel, COLOR_TEAM_A, tol=6) > 0, "player dot missing"
+
+
+# ---------------------------------------------------------------------- #
+# Run diagnostics (detection / tracking / team attribution)
+# ---------------------------------------------------------------------- #
+
+def test_pipeline_fills_run_diagnostics(tmp_path: Path):
+    """stats.diagnostics carries the full per-run report."""
+    input_path = write_test_video(tmp_path / "input.mp4")
+    pipeline = TacticalPipeline(
+        make_config(input_path, tmp_path / "out.mp4"), detector=StubDetector()
+    )
+    stats = pipeline.run()
+
+    diag = stats.diagnostics
+    assert diag["frames"] == FRAME_COUNT
+    assert diag["tracks"]["unique"] == 1
+    assert diag["tracks"]["losses"] == 0          # the track lives to the end
+    assert diag["detections"]["mean"] == pytest.approx(1.0)
+    assert diag["detections"]["display_mean"] == pytest.approx(1.0)  # stub conf 0.9
+    assert diag["active_tracks"]["max"] == 1
+    # Single player: no two-team model -> nobody ever labelled.
+    assert diag["teams"]["final_UNKNOWN"] == 1
+    assert diag["teams"]["ab_switches_total"] == 0
+
+    # The same object is exposed for programmatic access after the run.
+    assert pipeline.diagnostics.summary()["frames"] == FRAME_COUNT
+
+
+def test_pipeline_diagnostics_count_team_switches_in_a_two_team_run(tmp_path: Path):
+    """A settled two-team clip should finish with zero A<->B switches."""
+    input_path = write_two_team_video(tmp_path / "two_teams.mp4")
+    stats = TacticalPipeline(
+        make_config(input_path, tmp_path / "out.mp4"),
+        detector=BoxStubDetector(TWO_TEAM_BOXES),
+    ).run()
+
+    teams = stats.diagnostics["teams"]
+    assert stats.diagnostics["frames"] == TWO_TEAM_FRAMES
+    assert teams["ab_switches_total"] == 0, teams
+    assert teams["stable_TEAM_A"] + teams["stable_TEAM_B"] == 4, teams
+    assert teams["final_UNKNOWN"] == 0, teams
+
+
+# ---------------------------------------------------------------------- #
+# --debug overlay
+# ---------------------------------------------------------------------- #
+
+# Badge background drawn behind the debug team/confidence text. Non-neutral on
+# purpose: white-on-black text anti-aliasing produces equal-channel greys, so
+# the badge colour must differ in *shape* (b != r) from any blend of text,
+# grass, legend and marker colours.
+DEBUG_BADGE_BGR = (50, 100, 150)
+
+
+def test_debug_overlay_adds_badge_and_roi_only_when_enabled():
+    """--debug adds the team/confidence badge + jersey ROI; default stays clean."""
+    from app.team_classifier import TeamClassifier
+    from app.tracker import TrackedObject
+
+    config = make_config(Path("unused-in.mp4"), Path("unused-out.mp4"))
+    tracks = [
+        TrackedObject(
+            track_id=1, bbox=(10.0, 80.0, 50.0, 180.0), class_id=0, class_name="player"
+        )
+    ]
+    grass = np.full((FRAME_SIZE[1], FRAME_SIZE[0], 3), (40, 90, 40), dtype=np.uint8)
+
+    debugged_pipeline = TacticalPipeline(config, detector=StubDetector(), debug=True)
+    debugged_pipeline._team_stage_enabled = True
+    debugged_pipeline._team_classifier = TeamClassifier(config.team_classifier)
+    debugged_pipeline.team_by_track[1] = 0
+    annotated = debugged_pipeline._annotate(grass.copy(), [], tracks, 0)
+    assert count_color_pixels(annotated, DEBUG_BADGE_BGR, tol=6) > 50, "badge missing"
+
+    # Same pipeline, debug off: the badge may not appear.
+    debugged_pipeline.debug = False
+    plain = debugged_pipeline._annotate(grass.copy(), [], tracks, 0)
+    assert count_color_pixels(plain, DEBUG_BADGE_BGR, tol=6) == 0, "badge leaked"
+
+
+def test_pipeline_runs_end_to_end_with_debug_enabled(tmp_path: Path):
+    """The debug overlay must not disturb the normal run/write path."""
+    input_path = write_test_video(tmp_path / "input.mp4", frames=10)
+    output_path = tmp_path / "annotated.mp4"
+
+    stats = TacticalPipeline(
+        make_config(input_path, output_path), detector=StubDetector(), debug=True
+    ).run()
+
+    assert stats.frames_processed == 10
+    assert output_path.exists() and output_path.stat().st_size > 0
+
+
+# ---------------------------------------------------------------------- #
+# Detection-for-display vs detection-for-tracking
+# ---------------------------------------------------------------------- #
+
+def test_ball_marker_is_gated_at_the_display_threshold():
+    """Weak ball candidates stay tracker-only; the marker needs display quality."""
+    from app.visualization import COLOR_BALL
+
+    config = make_config(Path("unused-in.mp4"), Path("unused-out.mp4"))
+    pipeline = TacticalPipeline(config, detector=StubDetector())
+    grass = np.full((FRAME_SIZE[1], FRAME_SIZE[0], 3), (40, 90, 40), dtype=np.uint8)
+    ball = Detection(
+        bbox=(60.0, 90.0, 80.0, 110.0), confidence=0.2, class_id=32, class_name="ball"
+    )
+
+    weak = pipeline._annotate(grass.copy(), [ball], [], 0)
+    assert count_color_pixels(weak, COLOR_BALL, tol=20) == 0, "weak ball leaked into the frame"
+
+    ball.confidence = 0.9
+    strong = pipeline._annotate(grass.copy(), [ball], [], 0)
+    assert count_color_pixels(strong, COLOR_BALL, tol=20) > 0, "display-grade ball not drawn"

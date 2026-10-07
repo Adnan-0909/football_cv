@@ -35,6 +35,7 @@ import numpy as np
 
 from app.config import AppConfig
 from app.detector import FootballDetector, Detection
+from app.diagnostics import RunDiagnostics
 from app.formation_analyzer import FormationAnalyzer
 from app.pitch import PitchCoordinate, PitchTransformer, foot_position
 from app.pitch_log import PitchLog
@@ -45,7 +46,7 @@ from app.pitch_renderer import (
     pitch_panel_width,
     render_side_by_side,
 )
-from app.team_classifier import TEAM_A, TEAM_B, TeamClassifier, team_label
+from app.team_classifier import TEAM_A, TEAM_B, TeamClassifier, team_label, torso_roi
 from app.team_graph import TeamGraphBuilder, TeamGraphResult
 from app.team_log import TeamLog
 from app.tracker import PlayerTracker, TrackedObject
@@ -55,6 +56,13 @@ from app.visualization import COLOR_BALL, COLOR_TEAM_A, COLOR_TEAM_B, COLOR_UNKN
 
 # Marker colour for players whose team is not (yet) known.
 COLOR_UNKNOWN_PLAYER = COLOR_UNKNOWN
+# Debug overlay: badge colour for a labelled player whose model support fell
+# below the weakest gate (red = committed label, weak/stale evidence).
+COLOR_LOW_CONFIDENCE = (0, 0, 255)
+# Debug overlay: badge background. Deliberately non-neutral (blue channel
+# != red channel): no text anti-aliasing, grass, legend or team-marker blend
+# can produce it, so tests can detect the badge by exact colour.
+COLOR_DEBUG_BADGE = (50, 100, 150)
 
 # Progress is logged every N processed frames.
 LOG_EVERY_N_FRAMES = 50
@@ -91,6 +99,9 @@ class PipelineStats:
     # Stage 7: last processed frame's teammate graph (edges + network
     # metrics) - only filled in Stage 5 runs.
     graph_result: Optional[TeamGraphResult] = None
+    # Run diagnostics (see app.diagnostics): detection/tracking/team
+    # statistics including team-label switches per track.
+    diagnostics: Dict[str, object] = field(default_factory=dict)
 
     @property
     def processing_fps(self) -> float:
@@ -130,6 +141,7 @@ class TacticalPipeline:
         tracker: Optional[PlayerTracker] = None,
         visualizer: Optional[TacticalVisualizer] = None,
         stage5: bool = False,
+        debug: bool = False,
     ) -> None:
         """
         Args:
@@ -140,6 +152,10 @@ class TacticalPipeline:
             stage5: Emit the Stage 5 side-by-side output (annotated footage on
                 the left, tactical pitch with Stage 6/7 overlays on the right).
                 Off by default, so the plain pipeline output is unchanged.
+            debug: Draw the per-player diagnostic overlay (team label +
+                team confidence badge, jersey-ROI rectangle) on top of the
+                normal annotation, so detection / tracking / classification
+                failures can be told apart visually. Off by default.
         """
         self.config = config
         self.detector = detector if detector is not None else FootballDetector(config.model)
@@ -149,6 +165,12 @@ class TacticalPipeline:
         )
         self.logger = logging.getLogger("football_tracker.pipeline")
         self.stage5 = bool(stage5)
+        self.debug = bool(debug)
+        # Per-frame detection/tracking/team statistics for this run
+        # (rebuilt at the start of every run(); see app.diagnostics).
+        self.diagnostics = RunDiagnostics(
+            display_threshold=self.config.model.confidence_threshold
+        )
 
         # Filled by _update_teams(): team_id (TEAM_A/TEAM_B/None) per track_id,
         # persisted across frames so assignments never flicker.
@@ -207,6 +229,9 @@ class TacticalPipeline:
             )
 
         stats = PipelineStats(input_path=input_path, output_path=output_path)
+        self.diagnostics = RunDiagnostics(
+            display_threshold=self.config.model.confidence_threshold
+        )
         self._probe_optional_stages()
 
         self.logger.info("Loading detection model (first run may download weights)...")
@@ -254,6 +279,12 @@ class TacticalPipeline:
                     # Stage 3: cluster jersey colours and assign teams first,
                     # so the annotation and the team log use the same labels.
                     self._update_teams(frame, tracks, frame_index)
+                    # Bookkeeping for the end-of-run diagnostics report
+                    # (attributes missing players / wrong labels to detection,
+                    # tracking or classification - see app.diagnostics).
+                    self.diagnostics.record(
+                        frame_index, detections, tracks, self.team_by_track
+                    )
                     # Stage 4: project every player's foot onto the top-down
                     # pitch (per-frame positions - players move).
                     self._update_pitch(tracks)
@@ -305,7 +336,15 @@ class TacticalPipeline:
                     writer.write(annotated)
 
                     stats.frames_processed += 1
-                    stats.detections_total += len(detections)
+                    # Display-grade detections only (>= confidence_threshold):
+                    # the weaker candidates exist solely for the tracker and
+                    # must not inflate reported counts (log/HUD stay
+                    # comparable with runs that only emit display detections).
+                    stats.detections_total += sum(
+                        1
+                        for d in detections
+                        if d.confidence >= self.config.model.confidence_threshold
+                    )
                     stats.tracks_total += len(tracks)
                     player_ids = {t.track_id for t in tracks if t.class_name == "player"}
                     stats.unique_track_ids.update(t.track_id for t in tracks)
@@ -361,6 +400,8 @@ class TacticalPipeline:
                         metric["avg_teammate_distance"],
                         metric["max_teammate_distance"],
                     )
+        stats.diagnostics = self.diagnostics.summary()
+        self.logger.info("Run diagnostics:\n%s", self.diagnostics.text())
         self.logger.info("Pipeline finished: %s", stats.summary())
         return stats
 
@@ -620,11 +661,17 @@ class TacticalPipeline:
                 confidence=track.confidence,
             )
             self._draw_trail(frame, track, color)
+            if self.debug:
+                self._draw_debug_player(frame, track, color)
 
-        # Keep the ball visible even when tracker.player_only excludes it.
+        # Keep the ball visible even when tracker.player_only excludes it -
+        # at display quality only, so weak candidates cannot draw markers.
         if not ball_tracked:
             for detection in detections:
-                if detection.class_name == "ball":
+                if (
+                    detection.class_name == "ball"
+                    and detection.confidence >= self.config.model.confidence_threshold
+                ):
                     self.visualizer.draw_ball_marker(frame, detection.bbox, COLOR_BALL)
 
         # Stage 3: show which colour means which team, with live counts.
@@ -646,7 +693,13 @@ class TacticalPipeline:
             ]
             self.visualizer.draw_radar_minimap(frame, radar_players, self.ball_pitch)
 
-        self._draw_hud(frame, frame_index, len(detections), players, len(tracks))
+        # HUD counts display-grade detections (candidates are tracker-only).
+        displayable = sum(
+            1
+            for d in detections
+            if d.confidence >= self.config.model.confidence_threshold
+        )
+        self._draw_hud(frame, frame_index, displayable, players, len(tracks))
         return frame
 
     def _team_counts(self, tracks: List[TrackedObject]) -> Dict[str, int]:
@@ -665,6 +718,61 @@ class TacticalPipeline:
         if team == TEAM_B:
             return COLOR_TEAM_B
         return COLOR_UNKNOWN_PLAYER
+
+    def _draw_debug_player(
+        self,
+        frame: np.ndarray,
+        track: TrackedObject,
+        color: tuple[int, int, int],
+    ) -> None:
+        """
+        Debug overlay for one player (``--debug``).
+
+        Draws two things the normal annotation omits:
+
+        * the jersey ROI rectangle - exactly the pixels Stage 3 reads (shared
+          geometry via :func:`app.team_classifier.torso_roi`), so a crop that
+          lands on grass / a blurred torso is visible immediately;
+        * a badge under the player with ``LABEL confidence`` from the team
+          model. UNKNOWN stays white; a labelled player whose evidence
+          dropped below the weakest gate (< 0.25) gets a red badge, which
+          makes stale or wrong assignments stand out frame by frame.
+        """
+        left, top, right, bottom = torso_roi(track.bbox, self.config.team_classifier)
+        cv2.rectangle(frame, (left, top), (right, bottom), color, 1)
+
+        if not self._team_stage_enabled or self._team_classifier is None:
+            return
+        label = team_label(self.team_by_track.get(track.track_id))
+        conf = self._team_classifier.team_confidence(track.track_id)
+        text = f"{label} {conf:.2f}"
+        if label == "UNKNOWN":
+            text_color = COLOR_UNKNOWN_PLAYER
+        elif conf < 0.25:
+            text_color = COLOR_LOW_CONFIDENCE
+        else:
+            text_color = color
+
+        frame_h, frame_w = frame.shape[:2]
+        (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        x1, y1, x2, y2 = (int(v) for v in track.bbox)
+        tx = min(max(x1, 2), max(2, frame_w - text_w - 4))
+        # Below the foot ellipse (vertical radius ~ bbox width / 6); when the
+        # player sits at the bottom edge, fall back above the ID label.
+        ty = y2 + max(x2 - x1, 8) // 6 + text_h + 8
+        if ty + 3 > frame_h:
+            ty = max(y1 - 26, text_h + 6)
+        cv2.rectangle(
+            frame, (tx - 3, ty - text_h - 3), (tx + text_w + 3, ty + 3), COLOR_DEBUG_BADGE, -1
+        )
+        if text_color == COLOR_LOW_CONFIDENCE:
+            cv2.rectangle(
+                frame, (tx - 3, ty - text_h - 3), (tx + text_w + 3, ty + 3),
+                COLOR_LOW_CONFIDENCE, 1,
+            )
+        cv2.putText(
+            frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1, cv2.LINE_AA
+        )
 
     @staticmethod
     def _draw_trail(frame: np.ndarray, track: TrackedObject, color: tuple[int, int, int]) -> None:
