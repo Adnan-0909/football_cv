@@ -507,10 +507,9 @@ class TeamClassifier:
 
     def _maybe_fit(self, frame_index: int, live_ids: Set[int]) -> None:
         """Refit (or first-fit) the colour model when due and enough data exists."""
-        # First attempt runs as soon as the samples suffice; every later attempt
-        # (successful or not - e.g. kits that only become separable once both
-        # teams show up) waits for the refit interval.
-        if self._attempts > 0 and (frame_index - self._last_fit_index) < self.config.recluster_interval:
+        # First fit retries every frame until a valid two-team model is established;
+        # once established, reclustering obeys the recluster interval cooldown.
+        if self._model is not None and (frame_index - self._last_fit_index) < self.config.recluster_interval:
             return
 
         samples, votes, n_tracks = self._collect_fit_samples(live_ids)
